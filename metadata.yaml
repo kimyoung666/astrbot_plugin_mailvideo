@@ -1,0 +1,12 @@
+name: astrbot_plugin_mailvideo
+display_name: 邮箱取址搜片神器
+desc: 登录邮箱（默认 QQ 邮箱）发送邮件并读取回信中的站点地址，据此在目标网站按用户指令搜索视频，最后把视频文件回传给用户。
+short_desc: 邮箱取址 + 站点搜视频 + 回传视频文件
+version: v1.1.0
+author: kimyoung666
+repo: https://github.com/kimyoung666/astrbot_plugin_mailvideo
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - lark

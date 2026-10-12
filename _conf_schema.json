@@ -1,0 +1,177 @@
+{
+  "email_account": {
+    "description": "登录/发件邮箱地址",
+    "type": "string",
+    "default": "",
+    "hint": "例如 123456@qq.com。QQ 邮箱需先在网页版设置中开启 IMAP/SMTP 服务。"
+  },
+  "email_auth_code": {
+    "description": "邮箱授权码",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true,
+    "hint": "QQ 邮箱为「IMAP/SMTP 授权码」，不是 QQ 登录密码。"
+  },
+  "imap_server": {
+    "description": "IMAP 服务器",
+    "type": "string",
+    "default": "imap.qq.com"
+  },
+  "imap_port": {
+    "description": "IMAP 端口（SSL）",
+    "type": "int",
+    "default": 993
+  },
+  "smtp_server": {
+    "description": "SMTP 服务器",
+    "type": "string",
+    "default": "smtp.qq.com"
+  },
+  "smtp_port": {
+    "description": "SMTP 端口（SSL）",
+    "type": "int",
+    "default": 465
+  },
+  "recipient_email": {
+    "description": "收件邮箱（用户设置的邮箱）",
+    "type": "string",
+    "default": "",
+    "hint": "插件会向该邮箱发送邮件，并等待其回信，从回信正文中提取站点地址。"
+  },
+  "mail_subject": {
+    "description": "发信主题",
+    "type": "string",
+    "default": "获取地址",
+    "hint": "如对方是「关键词自动回复」服务，请填写其要求的触发词。"
+  },
+  "mail_body": {
+    "description": "发信正文（任意消息）",
+    "type": "text",
+    "default": "获取最新地址"
+  },
+  "reply_wait_timeout": {
+    "description": "等待回信超时（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "reply_poll_interval": {
+    "description": "轮询回信间隔（秒）",
+    "type": "int",
+    "default": 5
+  },
+  "address_regex": {
+    "description": "自定义地址提取正则（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用内置规则。填写后优先按此正则的捕获组提取。"
+  },
+  "site_address": {
+    "description": "【地址】固定站点地址（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "填了就直接使用该地址，完全跳过「发信→等回信」环节（也不怕插件数据被清）。留空则走原来的「邮件取址 + 缓存回退」流程。例：https://example.cc/"
+  },
+  "use_cache_on_fail": {
+    "description": "提取失败时回退上次成功地址",
+    "type": "bool",
+    "default": true
+  },
+  "search_url_template": {
+    "description": "站点搜索 URL 模板",
+    "type": "string",
+    "default": "{base}/search?wd={keyword}",
+    "hint": "支持 {base}（邮件提取到的站点地址）与 {keyword}（用户关键词）占位符。"
+  },
+  "max_results": {
+    "description": "最多返回的视频数",
+    "type": "int",
+    "default": 1
+  },
+  "cookie": {
+    "description": "目标站点 Cookie（可选）",
+    "type": "text",
+    "default": "",
+    "secret": true
+  },
+  "http_proxy": {
+    "description": "HTTP/SOCKS 代理（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+  },
+  "ffmpeg_path": {
+    "description": "ffmpeg 可执行文件路径（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "留空则使用系统 PATH 中的 ffmpeg。m3u8 合并、音视频合流需要它。"
+  },
+  "send_as": {
+    "description": "回传形式",
+    "type": "string",
+    "default": "video",
+    "options": [
+      "video",
+      "file"
+    ]
+  },
+  "max_video_size_mb": {
+    "description": "单个视频大小上限（MB）",
+    "type": "int",
+    "default": 1024,
+    "hint": "超过该值不再直接发文件，改为返回直链文本，避免平台发送失败。建议配合「画质压缩」使用：压缩后再判断，更容易直接发出去。"
+  },
+  "compress_enable": {
+    "description": "【压缩】启用画质压缩",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，下载完成的视频会先转码压缩再发送（体积明显变小，但会多花一点转换时间）。注意：压缩发生在下载之后，不会减少下载耗时。"
+  },
+  "compress_preset": {
+    "description": "【压缩】编码预设（速度/压缩率权衡）",
+    "type": "string",
+    "default": "veryfast",
+    "hint": "libx264 预设。越快越省时间、压缩率越低。可选：ultrafast / superfast / veryfast / faster / fast / medium / slow。推荐 veryfast；机器强可试 medium。"
+  },
+  "compress_target_height": {
+    "description": "【压缩】目标分辨率高度（0=保持原画质只降码率）",
+    "type": "int",
+    "default": 720,
+    "hint": "例：填 720 则 1080p 视频会缩到 720p。填 480 更省流量但更糊。填 0 表示不缩放分辨率，只靠 CRF 降码率。"
+  },
+  "compress_crf": {
+    "description": "【压缩】质量因子 CRF（越大越糊越小）",
+    "type": "int",
+    "default": 30,
+    "hint": "x264 常用范围 18~32。23 接近原画质，28 尚可，30 明显变小，32+ 画质下降明显。仅在未填「目标码率」时生效。"
+  },
+  "compress_target_bitrate": {
+    "description": "【压缩】目标视频码率（可选，如 800k）",
+    "type": "string",
+    "default": "",
+    "hint": "填了就按固定码率压缩（体积可预估），留空则用 CRF 智能压缩、画质更均匀。例：600k / 1M。"
+  },
+  "compress_audio_bitrate": {
+    "description": "【压缩】音频码率",
+    "type": "string",
+    "default": "64k",
+    "hint": "音频统一转 AAC。64k 够用，96k/128k 音质更好也更占体积。"
+  },
+  "compress_threshold_mb": {
+    "description": "【压缩】仅当文件大于该值才压缩（MB，0=总是压缩）",
+    "type": "int",
+    "default": 100,
+    "hint": "填 100 表示小于 100MB 的小视频直接原样发送、不浪费转换时间；只有大文件才压缩。填 0 则所有视频都压。"
+  },
+  "max_download_attempts": {
+    "description": "【下载】最多尝试的候选数（0=自动）",
+    "type": "int",
+    "default": 0,
+    "hint": "搜索出多个候选时，失败会依次往下试。0 表示自动（回传数+1）。调小可减少无效下载，调大可提高成功率。"
+  },
+  "allowed_users": {
+    "description": "允许使用的用户 ID 列表（留空 = 所有人）",
+    "type": "list",
+    "default": []
+  }
+}
