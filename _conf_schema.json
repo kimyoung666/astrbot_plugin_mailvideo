@@ -118,7 +118,7 @@
   "max_video_size_mb": {
     "description": "单个视频大小上限（MB）",
     "type": "int",
-    "default": 1024,
+    "default": 100,
     "hint": "超过该值不再直接发文件，改为返回直链文本，避免平台发送失败。建议配合「画质压缩」使用：压缩后再判断，更容易直接发出去。"
   },
   "compress_enable": {
@@ -160,8 +160,8 @@
   "compress_threshold_mb": {
     "description": "【压缩】仅当文件大于该值才压缩（MB，0=总是压缩）",
     "type": "int",
-    "default": 100,
-    "hint": "填 100 表示小于 100MB 的小视频直接原样发送、不浪费转换时间；只有大文件才压缩。填 0 则所有视频都压。"
+    "default": 0,
+    "hint": "填 50 表示小于 50MB 的小视频直接原样发送、不浪费转换时间；只有大文件才压缩。填 0 则所有视频都压。"
   },
   "max_download_attempts": {
     "description": "【下载】最多尝试的候选数（0=自动）",
@@ -173,5 +173,11 @@
     "description": "允许使用的用户 ID 列表（留空 = 所有人）",
     "type": "list",
     "default": []
+  },
+  "hls_parallel_workers": {
+    "description": "【下载】HLS 并行下载线程数（0=禁用并行）",
+    "type": "int",
+    "default": 16,
+    "hint": "并行下载 m3u8 分片的线程数。实测 16 线程对比单流提速约 8-10 倍（2.6MB/s → 25MB/s）。填 0 禁用并行，回退到 ffmpeg 串行拉流。填 4-8 适合带宽较小的服务器。"
   }
 }

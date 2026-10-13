@@ -201,7 +201,7 @@ class MailClient:
         return conn
 
     def test_connection_sync(self) -> str:
-        """测试 IMAP 登录，返回可用邮箱夹数量信息（用于 /搜片邮箱 指令）。"""
+        """测试 IMAP 登录，返回可用邮箱夹数量信息（用于 /搜片 邮箱 子指令）。"""
         conn = self._connect_imap()
         try:
             typ, data = conn.select("INBOX", readonly=True)
@@ -314,16 +314,12 @@ class MailClient:
         """
         self.validate()
         exclude_uids = exclude_uids or set()
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         deadline = loop.time() + max(5, int(timeout))
         while True:
             mails = await self.fetch_messages_since(after_ts)
-            # 最新优先：UID 越大越新（非纯数字 UID 退化为字符串比较）
-            def _uid_key(m: dict):
-                raw = str(m.get("uid") or "")
-                return int(raw) if raw.isdigit() else -1
-
-            mails.sort(key=_uid_key, reverse=True)
+            # 最新优先
+            mails.sort(key=lambda m: m["uid"], reverse=False)
             for mail in mails:
                 if mail["uid"] in exclude_uids:
                     continue

@@ -1,4 +1,4 @@
-"""AstrBot 插件：邮箱取址搜片神器。
+"""AstrBot 插件：邮箱取址视频搜索。
 
 流程（指令式，一条命令跑完）：
     1. 登录邮箱（默认 QQ 邮箱），向配置的收件邮箱发送一封邮件；
@@ -6,11 +6,16 @@
     3. 用该地址作为站点入口，按用户关键词搜索视频（yt-dlp 通用解析）；
     4. 下载视频文件，直接回传给用户。
 
-指令：
-    /搜片 <关键词>    主流程
-    /搜片地址         只跑邮箱环节，返回并缓存当前站点地址（别名 /取地址）
-    /搜片邮箱         测试邮箱 IMAP/SMTP 连通性（别名 /邮箱测试）
-    /搜片帮助         用法说明
+指令（统一入口 /搜片，按关键词分发）：
+    /搜片 <关键词>    主流程：搜索并回传视频
+    /搜片 地址        只跑邮箱环节，返回并缓存当前站点地址
+    /搜片 邮箱        测试邮箱 IMAP/SMTP 连通性
+    /搜片 帮助        用法说明
+
+注意：QQ 官方平台仅在用户发消息后 5 分钟内允许主动消息（且最多 5 条），
+长流程（取址+搜索+下载）结束时的回传可能因窗口过期而发送失败（"主动消息失败,
+无权限"）。此时结果会自动暂存为「待投递」，用户下次发送任意消息（私聊即任意
+消息，群聊需 @ 机器人或调用本插件指令）时自动补发。
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -25,6 +31,7 @@ from typing import Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import MessageChain, filter, AstrMessageEvent
+from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
@@ -78,7 +85,7 @@ VideoFetchError = _video_fetcher.VideoFetchError
 PLUGIN_NAME = "astrbot_plugin_mailvideo"
 
 
-@register(PLUGIN_NAME, "kimyoung666", "邮箱取址搜片神器", "1.1.0",
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.1.0",
           "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -88,6 +95,7 @@ class MailVideoPlugin(Star):
         self.store = StateStore(self.data_dir)
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._gc_pending_files(self.data_dir / "pending")
 
     # ================================================================== #
     # 配置读取
@@ -119,6 +127,7 @@ class MailVideoPlugin(Star):
             cookie=str(self._cfg("cookie", "") or ""),
             proxy=str(self._cfg("http_proxy", "") or ""),
             ffmpeg_path=str(self._cfg("ffmpeg_path", "") or ""),
+            hls_parallel_workers=int(self._cfg("hls_parallel_workers", 16) or 16),
         )
 
     def _allowed(self, event: AstrMessageEvent) -> bool:
@@ -130,15 +139,64 @@ class MailVideoPlugin(Star):
     # ================================================================== #
     # 指令
     # ================================================================== #
+    @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE)
+    async def on_private_message(self, event: AstrMessageEvent):
+        """私聊钩子：用户发消息时，优先补发该会话暂存的「待投递」结果
+        （如长流程结束后因 QQ 官方主动消息窗口过期而没发出去的视频）。"""
+        await self._deliver_pending_if_any(event)
+
     @filter.command("搜片")
     async def cmd_video(self, event: AstrMessageEvent):
-        """根据关键词搜索并回传视频：/搜片 <关键词>"""
+        """统一入口：/搜片 <关键词> 搜索视频；/搜片 地址|邮箱|帮助 为子指令。"""
         if not self._allowed(event):
             yield event.plain_result("你没有权限使用该指令。")
             return
+        await self._deliver_pending_if_any(event)
         keyword = self._parse_keyword(event.message_str)
+        kw = (keyword or "").strip().lower()
+
+        # ── 子指令：/搜片 地址 ──
+        if kw in ("地址", "取地址"):
+            yield event.plain_result("\u200b📮 正在获取站点地址…")
+            umo = event.unified_msg_origin
+            task = asyncio.create_task(self._address_only(umo))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            return
+
+        # ── 子指令：/搜片 邮箱 ──
+        if kw in ("邮箱", "邮箱测试", "测试邮箱"):
+            try:
+                client = self._build_mail_client()
+                info = await client.test_connection()
+                yield event.plain_result(f"✅ 邮箱连接正常。\n{info}")
+            except Exception as e:
+                logger.error(f"[mailvideo] 邮箱测试失败: {e}")
+                yield event.plain_result(f"❌ 邮箱连接失败：{e}")
+            return
+
+        # ── 子指令：/搜片 帮助 ──
+        if kw in ("帮助", "help", "用法"):
+            fixed = str(self._cfg("site_address", "") or "").strip()
+            cached = fixed or self.store.get_last_address() or "（暂无）"
+            yield event.plain_result(
+                "邮箱取址视频搜索 · 用法\n"
+                "/搜片 <关键词>   搜索并回传视频\n"
+                "/搜片 地址        获取并缓存站点地址\n"
+                "/搜片 邮箱        测试邮箱连接\n"
+                "/搜片 帮助        显示本帮助\n"
+                f"\n当前缓存站点地址：{cached}\n"
+                "首次使用请先在插件配置中填写邮箱账号、授权码与收件邮箱。"
+            )
+            return
+
+        # ── 主流程：/搜片 <关键词> ──
         if not keyword:
-            yield event.plain_result("用法：/搜片 <关键词>\n例如：/搜片 复仇者联盟")
+            yield event.plain_result(
+                "用法：/搜片 <关键词>\n例如：/搜片 鞠婧祎\n\n"
+                "子指令：\n/搜片 地址   获取站点地址\n"
+                "/搜片 邮箱   测试邮箱连接\n/搜片 帮助   显示帮助"
+            )
             return
 
         umo = event.unified_msg_origin
@@ -158,49 +216,6 @@ class MailVideoPlugin(Star):
         task = asyncio.create_task(self._run_pipeline(umo, keyword, lock))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-
-    @filter.command("搜片地址", alias={"取地址"})
-    async def cmd_address(self, event: AstrMessageEvent):
-        """只跑邮箱环节，获取并缓存当前站点地址。"""
-        if not self._allowed(event):
-            yield event.plain_result("你没有权限使用该指令。")
-            return
-        yield event.plain_result("\u200b📮 正在获取站点地址…")
-        umo = event.unified_msg_origin
-        task = asyncio.create_task(self._address_only(umo))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    @filter.command("搜片邮箱", alias={"邮箱测试"})
-    async def cmd_mailtest(self, event: AstrMessageEvent):
-        """测试邮箱 IMAP 连通性与授权码。"""
-        if not self._allowed(event):
-            yield event.plain_result("你没有权限使用该指令。")
-            return
-        try:
-            client = self._build_mail_client()
-            info = await client.test_connection()
-            yield event.plain_result(f"✅ 邮箱连接正常。\n{info}")
-        except Exception as e:
-            logger.error(f"[mailvideo] 邮箱测试失败: {e}")
-            yield event.plain_result(f"❌ 邮箱连接失败：{e}")
-
-    @filter.command("搜片帮助")
-    async def cmd_help(self, event: AstrMessageEvent):
-        """显示插件用法。"""
-        fixed = str(self._cfg("site_address", "") or "").strip()
-        cached = fixed or self.store.get_last_address() or "（暂无）"
-        mode = "固定地址 site_address" if fixed else "邮箱取址（发信→等回信）"
-        yield event.plain_result(
-            "邮箱取址视频搜索 · 用法\n"
-            "/搜片 <关键词>   搜索并回传视频\n"
-            "/搜片地址        获取并缓存站点地址（别名 /取地址）\n"
-            "/搜片邮箱        测试邮箱连接（别名 /邮箱测试）\n"
-            "/搜片帮助        显示本帮助\n"
-            f"\n当前取址模式：{mode}\n"
-            f"当前站点地址：{cached}\n"
-            "首次使用请先在插件配置中填写邮箱账号、授权码与收件邮箱。"
-        )
 
     # ================================================================== #
     # 流程实现
@@ -223,7 +238,7 @@ class MailVideoPlugin(Star):
                 # ---- ① 取地址 ----
                 address, _ = await self._fetch_address(umo)
                 if not address:
-                    await self._send_text(umo, "❌ 未能获取站点地址，流程终止。")
+                    await self._send_text(umo, "❌ 未能获取站点地址，流程终止。", critical=True)
                     return
 
                 # ---- ② 搜索 ----
@@ -231,7 +246,7 @@ class MailVideoPlugin(Star):
                 fetcher = self._build_fetcher()
                 candidates = await asyncio.to_thread(fetcher.search, address, keyword)
                 if not candidates:
-                    await self._send_text(umo, "❌ 未搜索到相关视频。")
+                    await self._send_text(umo, "❌ 未搜索到相关视频。", critical=True)
                     return
 
                 if not fetcher.ffmpeg_available():
@@ -241,12 +256,11 @@ class MailVideoPlugin(Star):
 
                 # ---- ③ 下载 ----
                 max_results = max(1, int(self._cfg("max_results", 1) or 1))
-                max_size_mb = max(1, int(self._cfg("max_video_size_mb", 1024) or 1024))
-                # 最多尝试的候选数：0 = 自动（回传数 + 1），避免无脑刷完全部候选
-                max_attempts = int(self._cfg("max_download_attempts", 0) or 0)
+                max_size_mb = max(1, int(self._cfg("max_video_size_mb", 100) or 100))
+                # 最多尝试的候选数：回传数 + 少量容错，避免无脑刷 6 个
+                max_attempts = max(1, int(self._cfg("max_download_attempts", 0) or 0))
                 if max_attempts <= 0:
                     max_attempts = max_results + 1
-                max_attempts = max(1, max_attempts)
                 got = 0
                 attempts = 0
                 errors: list[str] = []
@@ -297,16 +311,20 @@ class MailVideoPlugin(Star):
                             umo,
                             f"⚠️ 文件过大（{size_mb:.1f}MB > {max_size_mb}MB），"
                             f"改为返回链接：\n{result.get('webpage_url') or url}",
+                            critical=True,
                         )
                         got += 1
                         continue
-                    await self._send_video(umo, path)
+                    ok = await self._send_video(umo, path)
                     got += 1
-                    logger.info(f"[mailvideo] 已回传第 {got} 个视频: {path.name}")
+                    if ok:
+                        logger.info(f"[mailvideo] 已回传第 {got} 个视频: {path.name}")
+                    else:
+                        logger.info(f"[mailvideo] 第 {got} 个视频已转为待投递: {path.name}")
 
                 if got == 0:
                     detail = ("；".join(errors[-2:])) if errors else "无可用结果"
-                    await self._send_text(umo, f"❌ 下载失败：{detail}")
+                    await self._send_text(umo, f"❌ 下载失败：{detail}", critical=True)
                 else:
                     logger.info(
                         f"[mailvideo] 任务结束 | 成功回传 {got} 个 | 尝试 {attempts} 次"
@@ -377,19 +395,134 @@ class MailVideoPlugin(Star):
     # ================================================================== #
     # 发送辅助
     # ================================================================== #
-    async def _send_text(self, umo: str, text: str):
+    async def _send_text(self, umo: str, text: str, critical: bool = False) -> bool:
+        """发送文本。critical=True 的结果若发送失败，会暂存为「待投递」，
+        等用户下次发消息时自动补发（应对 QQ 官方主动消息窗口过期）。"""
         try:
             await self.context.send_message(umo, MessageChain([Comp.Plain("\u200b" + text)]))
+            return True
         except Exception as e:
             logger.error(f"[mailvideo] 发送文本失败: {e}")
+            if critical:
+                self._stash_pending(umo, {"type": "text", "text": text})
+            return False
 
-    async def _send_video(self, umo: str, path: Path):
+    async def _send_video(self, umo: str, path: Path) -> bool:
+        """发送视频文件，成功返回 True。
+
+        QQ 官方平台仅允许在用户发消息后 5 分钟内主动消息（最多 5 条），
+        长流程结束时窗口可能已过期：先重试几次（用户这期间可能发新消息
+        刷新窗口），仍失败则暂存为「待投递」，等用户下次发消息时补发。
+        """
         send_as = str(self._cfg("send_as", "video") or "video").lower()
-        if send_as == "file":
-            chain = MessageChain([Comp.File(file=str(path), name=path.name)])
-        else:
-            chain = MessageChain([Comp.Video.fromFileSystem(path=str(path))])
-        await self.context.send_message(umo, chain)
+        for attempt in range(1, 4):
+            try:
+                if send_as == "file":
+                    chain = MessageChain([Comp.File(file=str(path), name=path.name)])
+                else:
+                    chain = MessageChain([Comp.Video.fromFileSystem(path=str(path))])
+                await self.context.send_message(umo, chain)
+                return True
+            except Exception as e:
+                logger.warning(f"[mailvideo] 发送视频失败（第 {attempt}/3 次）: {e}")
+                if attempt < 3:
+                    await asyncio.sleep(20)
+        # 重试全部失败：暂存待投递，等用户下次发消息时补发
+        self._stash_pending(umo, {"type": "video", "path": str(path), "name": path.name})
+        return False
+
+    # ================================================================== #
+    # 待投递（发送失败兜底，应对平台主动消息限制）
+    # ================================================================== #
+    PENDING_MAX_AGE = 24 * 3600  # 待投递条目 24 小时后过期
+    PENDING_MAX_FILES = 10  # 待投递目录最多保留的文件数
+
+    def _stash_pending(self, umo: str, item: dict) -> None:
+        """把发送失败的结果存为「待投递」，用户下次发消息时补发。
+
+        视频类结果会把文件从 tmp 移入持久化目录，避免被 _cleanup 删掉。
+        """
+        try:
+            if item.get("type") == "video":
+                src = Path(item.get("path", ""))
+                if src.exists():
+                    pending_dir = self.data_dir / "pending"
+                    pending_dir.mkdir(parents=True, exist_ok=True)
+                    dest = pending_dir / f"{int(time.time())}_{src.name}"
+                    shutil.move(str(src), str(dest))
+                    item["path"] = str(dest)
+                    self._gc_pending_files(pending_dir)
+            self.store.set_pending(umo, item)
+            logger.warning(
+                f"[mailvideo] 已暂存待投递: 会话={umo} 类型={item.get('type')} "
+                f"（用户下次发送消息时自动补发）"
+            )
+        except Exception as e:
+            logger.error(f"[mailvideo] 暂存待投递失败: {e}")
+
+    def _gc_pending_files(self, pending_dir: Path) -> None:
+        """清理待投递目录：过期文件删除，最多保留最近 N 个。"""
+        try:
+            files = sorted(
+                pending_dir.glob("*"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            now = time.time()
+            for p in files:
+                if not p.is_file():
+                    continue
+                expired = now - p.stat().st_mtime > self.PENDING_MAX_AGE
+                overflow = files.index(p) >= self.PENDING_MAX_FILES
+                if expired or overflow:
+                    p.unlink(missing_ok=True)
+        except Exception as e:  # pragma: no cover
+            logger.debug(f"[mailvideo] 清理待投递文件失败: {e}")
+
+    def _discard_pending_file(self, item: dict) -> None:
+        try:
+            if item.get("type") == "video":
+                Path(item.get("path", "")).unlink(missing_ok=True)
+        except Exception:  # pragma: no cover
+            pass
+
+    async def _deliver_pending(self, event: AstrMessageEvent, item: dict) -> None:
+        """把待投递结果发到会话；仍失败则重新暂存，等下一次消息再试。"""
+        umo = event.unified_msg_origin
+        try:
+            if item.get("type") == "video":
+                path = Path(item.get("path", ""))
+                if not path.exists():
+                    logger.warning(f"[mailvideo] 待投递文件不存在: {path}")
+                    return
+                send_as = str(self._cfg("send_as", "video") or "video").lower()
+                if send_as == "file":
+                    chain = MessageChain([Comp.File(file=str(path), name=path.name)])
+                else:
+                    chain = MessageChain([Comp.Video.fromFileSystem(path=str(path))])
+                await self.context.send_message(umo, chain)
+                path.unlink(missing_ok=True)
+                logger.info(f"[mailvideo] 待投递视频补发成功: {path.name}")
+            elif item.get("type") == "text":
+                await self._send_text(umo, "\u200b📬 补发之前的结果：\n" + str(item.get('text', '')))
+            else:
+                self._discard_pending_file(item)
+        except Exception as e:
+            logger.error(f"[mailvideo] 待投递补发失败: {e}，等用户下次消息再试")
+            self.store.set_pending(umo, item)
+
+    async def _deliver_pending_if_any(self, event: AstrMessageEvent) -> None:
+        """若会话有待投递结果（如窗口过期没发出去的视频），立即补发。"""
+        try:
+            item = self.store.pop_pending(event.unified_msg_origin)
+            if not item:
+                return
+            if time.time() - int(item.get("ts", 0) or 0) > self.PENDING_MAX_AGE:
+                self._discard_pending_file(item)
+                return
+            await self._deliver_pending(event, item)
+        except Exception as e:
+            logger.error(f"[mailvideo] 待投递处理异常: {e}")
 
     async def _maybe_compress(
         self, umo: str, fetcher, path: Path, size_mb: float, tmp_dir: Path
@@ -470,6 +603,7 @@ class MailVideoPlugin(Star):
         """从消息原文中去掉指令前缀，取出关键词。
 
         兼容 "/搜片 关键词"、"!搜片 关键词"、"搜片 关键词" 等写法；
+        子指令（地址/邮箱/帮助）也在 cmd_video 内按关键词分发。
         """
         raw = (raw or "").strip()
         m = re.search(r"[/!#]?\s*搜片\s+(.+)$", raw, re.S)

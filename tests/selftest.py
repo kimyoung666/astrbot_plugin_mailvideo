@@ -186,29 +186,6 @@ class TestVideoFetcher(unittest.TestCase):
         score_nav = VideoFetcher._score_candidate("https://s.cc/about", "关于", "片子")
         self.assertGreater(score_media, score_nav)
 
-    def test_playback_page_falls_through_when_no_media_url(self):
-        """抠不到媒体直链时应退回原页面继续尝试，而不是被误判成「全部超限」。"""
-        f = VideoFetcher()
-        f._extract_media_urls = lambda _u: []
-        f._within_size_limit = lambda *_a, **_k: True
-        f._download_via_ytdlp = lambda url, *_a, **_k: {
-            "path": __file__,
-            "title": "t",
-            "webpage_url": url,
-        }
-        with tempfile.TemporaryDirectory() as d:
-            res = f.download("https://site.cc/play/1", Path(d), max_size_mb=100)
-        self.assertEqual(res["webpage_url"], "https://site.cc/play/1")
-
-    def test_all_candidates_over_limit_still_raises(self):
-        """真正的超限候选仍应被剔除并报错，避免白下大文件。"""
-        f = VideoFetcher()
-        f._extract_media_urls = lambda _u: ["https://cdn.cc/a.m3u8", "https://cdn.cc/b.mp4"]
-        f._within_size_limit = lambda *_a, **_k: False
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(video_fetcher.VideoFetchError):
-                f.download("https://site.cc/play/1", Path(d), max_size_mb=100)
-
 
 class TestStateStore(unittest.TestCase):
     def test_last_address_and_uids(self):

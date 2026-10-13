@@ -98,6 +98,24 @@ class StateStore:
         # 只保留最近 500 条，防止无限增长
         self.set("processed_uids", merged[-500:])
 
+    # 待投递（发送失败自动补发）字段 -------------------------------- #
+    def get_pending_map(self) -> dict[str, Any]:
+        val = self.get("pending_deliveries", {})
+        return val if isinstance(val, dict) else {}
+
+    def set_pending(self, umo: str, item: dict[str, Any]) -> None:
+        """记录指定会话的待投递（同会话覆盖旧记录）。"""
+        pending = self.get_pending_map()
+        pending[umo] = {**item, "ts": _now_ts()}
+        self.set("pending_deliveries", pending)
+
+    def pop_pending(self, umo: str) -> dict[str, Any] | None:
+        """取出指定会话的待投递，没有则返回 None。"""
+        pending = self.get_pending_map()
+        item = pending.pop(umo, None)
+        self.set("pending_deliveries", pending)
+        return item if isinstance(item, dict) else None
+
 
 def _now_ts() -> int:
     import time

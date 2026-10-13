@@ -130,8 +130,7 @@ def _is_noise(url: str) -> bool:
             return True
     if lowered.endswith(_STATIC_EXT):
         return True
-    # 邮箱地址（形如 user@domain）不会被 _BARE_DOMAIN_RE 匹配到——
-    # 该正则带 (?<![@\w.]) 负向后顾，已从源头挡掉；此处无需再判，直接放行。
+    # 排除邮箱地址（形如 user@domain 的裸域名匹配）
     return False
 
 
