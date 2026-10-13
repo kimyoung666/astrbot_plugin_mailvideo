@@ -83,10 +83,17 @@
     "default": "{base}/search?wd={keyword}",
     "hint": "支持 {base}（邮件提取到的站点地址）与 {keyword}（用户关键词）占位符。"
   },
-  "max_results": {
-    "description": "最多返回的视频数",
+  "select_candidates": {
+    "description": "【回传】候选清单最多列出几条",
     "type": "int",
-    "default": 1
+    "default": 10,
+    "hint": "搜索完成后列出的候选上限；用户回复序号后只下载选中的那一个。"
+  },
+  "select_timeout": {
+    "description": "【回传】候选选择的等待时间（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "超过该时长仍未回复序号，候选清单自动失效。"
   },
   "cookie": {
     "description": "目标站点 Cookie（可选）",
@@ -114,6 +121,11 @@
       "video",
       "file"
     ]
+  },
+  "send_heartbeat_interval": {
+    "description": "发送心跳日志间隔（秒）：等待平台上传返回期间，每隔多久写一条「发送中」日志，0/1 最小为 1",
+    "type": "int",
+    "default": 5
   },
   "max_video_size_mb": {
     "description": "单个视频大小上限（MB）",
@@ -163,12 +175,6 @@
     "default": 0,
     "hint": "填 50 表示小于 50MB 的小视频直接原样发送、不浪费转换时间；只有大文件才压缩。填 0 则所有视频都压。"
   },
-  "max_download_attempts": {
-    "description": "【下载】最多尝试的候选数（0=自动）",
-    "type": "int",
-    "default": 0,
-    "hint": "搜索出多个候选时，失败会依次往下试。0 表示自动（回传数+1）。调小可减少无效下载，调大可提高成功率。"
-  },
   "allowed_users": {
     "description": "允许使用的用户 ID 列表（留空 = 所有人）",
     "type": "list",
@@ -179,5 +185,23 @@
     "type": "int",
     "default": 16,
     "hint": "并行下载 m3u8 分片的线程数。实测 16 线程对比单流提速约 8-10 倍（2.6MB/s → 25MB/s）。填 0 禁用并行，回退到 ffmpeg 串行拉流。填 4-8 适合带宽较小的服务器。"
+  },
+  "direct_parallel_workers": {
+    "description": "【下载】直链多连接数（0=禁用）",
+    "type": "int",
+    "default": 8,
+    "hint": "单文件直链（mp4/flv/mkv）的分段并发连接数。仅当服务端支持 Range 且文件大于下面的阈值时生效；不支持 Range 的站点会自动退回单连接。小站建议 4-8，别开太大以免被限速或封 IP。"
+  },
+  "direct_parallel_min_mb": {
+    "description": "【下载】直链启用多连接的最小体积（MB）",
+    "type": "int",
+    "default": 4,
+    "hint": "小于该体积的直链不分段（小文件分段的握手开销反而更慢）。"
+  },
+  "compress_fuse_hls": {
+    "description": "【压缩】HLS 合并时顺带压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，m3u8 下载完成时把「合并」和「压缩」合成一次 ffmpeg 调用，不再落一份完整体积的中转 mp4，省一次全量读写、也省一份磁盘占用。仅在「压缩阈值」为 0（总是压缩）时生效；编码失败会自动退回普通合并，不影响下载。"
   }
 }

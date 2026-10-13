@@ -116,6 +116,29 @@ class StateStore:
         self.set("pending_deliveries", pending)
         return item if isinstance(item, dict) else None
 
+    # 候选选择会话（列候选 → 用户回序号 → 只下载该条） ---------------- #
+    def get_selection_map(self) -> dict[str, Any]:
+        val = self.get("selection_sessions", {})
+        return val if isinstance(val, dict) else {}
+
+    def set_selection(self, umo: str, data: dict[str, Any]) -> None:
+        """记录指定会话的待选候选（同会话覆盖旧记录）。"""
+        sessions = self.get_selection_map()
+        sessions[umo] = {**data, "ts": _now_ts()}
+        self.set("selection_sessions", sessions)
+
+    def get_selection(self, umo: str) -> dict[str, Any] | None:
+        """读取指定会话的待选候选（不删除）。"""
+        item = self.get_selection_map().get(umo)
+        return item if isinstance(item, dict) else None
+
+    def pop_selection(self, umo: str) -> dict[str, Any] | None:
+        """取出并删除指定会话的待选候选，没有则返回 None。"""
+        sessions = self.get_selection_map()
+        item = sessions.pop(umo, None)
+        self.set("selection_sessions", sessions)
+        return item if isinstance(item, dict) else None
+
 
 def _now_ts() -> int:
     import time

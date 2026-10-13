@@ -6,10 +6,15 @@
     3. 用该地址作为站点入口，按用户关键词搜索视频（yt-dlp 通用解析）；
     4. 下载视频文件，直接回传给用户。
 
+回传方式（固定为候选清单模式）：
+    搜索完成后先列出候选清单，用户回复序号后才下载并回传那一个；
+    只有用户明确选了哪一条，才会去下载，避免下错片子白等。
+
 指令（统一入口 /搜片，按关键词分发）：
-    /搜片 <关键词>    主流程：搜索并回传视频
+    /搜片 <关键词>    主流程：搜索并列出候选，回复序号后回传视频
     /搜片 地址        只跑邮箱环节，返回并缓存当前站点地址
     /搜片 邮箱        测试邮箱 IMAP/SMTP 连通性
+    /搜片 取消        放弃当前待选的候选清单
     /搜片 帮助        用法说明
 
 注意：QQ 官方平台仅在用户发消息后 5 分钟内允许主动消息（且最多 5 条），
@@ -84,9 +89,13 @@ VideoFetchError = _video_fetcher.VideoFetchError
 
 PLUGIN_NAME = "astrbot_plugin_mailvideo"
 
+# 候选选择：用户回复的文本 → 序号（兼容 "3" / "选3" / "#3" / "第3个" / "3号"）
+_SELECT_RE = re.compile(r"^(?:选|选择|第)?[#＃]?(\d{1,2})(?:号|个|条)?$")
+_CANCEL_WORDS = {"取消", "算了", "放弃", "不要了", "不用了", "退出", "cancel", "q"}
 
-@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.1.0",
-          "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
+
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.3.0",
+          "https://github.com/your-name/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -128,13 +137,48 @@ class MailVideoPlugin(Star):
             proxy=str(self._cfg("http_proxy", "") or ""),
             ffmpeg_path=str(self._cfg("ffmpeg_path", "") or ""),
             hls_parallel_workers=int(self._cfg("hls_parallel_workers", 16) or 16),
+            direct_parallel_workers=int(self._cfg("direct_parallel_workers", 8) or 0),
+            direct_parallel_min_mb=int(self._cfg("direct_parallel_min_mb", 4) or 4),
         )
+
+    def _fused_encode_opts(self, fetcher) -> Optional[dict]:
+        """决定是否把「压缩」提前到下载的合并阶段一趟完成。
+
+        返回压缩参数字典交给 ``VideoFetcher.download``（HLS 走「合并+压缩」
+        一次 ffmpeg 调用，不再落一份完整体积的中转 mp4）；返回 ``None``
+        则沿用原来的「下完整文件 → 再单独压缩」流程。
+
+        仅在**压缩阈值 = 0（总是压缩）**时启用：阈值 > 0 时需要先知道文件
+        实际多大才能决定压不压，而下载阶段无从预判。
+        """
+        if not bool(self._cfg("compress_enable", False)):
+            return None
+        if not bool(self._cfg("compress_fuse_hls", True)):
+            return None
+        if int(self._cfg("compress_threshold_mb", 0) or 0) > 0:
+            return None
+        if not fetcher.ffmpeg_available():
+            return None
+        return {
+            "target_height": int(self._cfg("compress_target_height", 720) or 0),
+            "crf": int(self._cfg("compress_crf", 30) or 30),
+            "preset": str(self._cfg("compress_preset", "veryfast") or "veryfast").strip(),
+            "target_bitrate": str(self._cfg("compress_target_bitrate", "") or "").strip(),
+            "audio_bitrate": str(self._cfg("compress_audio_bitrate", "64k") or "64k").strip(),
+        }
 
     def _allowed(self, event: AstrMessageEvent) -> bool:
         allow = self._cfg("allowed_users", []) or []
         if not allow:
             return True
         return str(event.get_sender_id()) in {str(x) for x in allow}
+
+    # 候选清单相关配置 ------------------------------------------------- #
+    def _select_timeout(self) -> int:
+        return max(10, int(self._cfg("select_timeout", 180) or 180))
+
+    def _select_max(self) -> int:
+        return max(1, int(self._cfg("select_candidates", 10) or 10))
 
     # ================================================================== #
     # 指令
@@ -144,6 +188,21 @@ class MailVideoPlugin(Star):
         """私聊钩子：用户发消息时，优先补发该会话暂存的「待投递」结果
         （如长流程结束后因 QQ 官方主动消息窗口过期而没发出去的视频）。"""
         await self._deliver_pending_if_any(event)
+
+    @filter.event_message_type(EventMessageType.ALL)
+    async def on_any_message(self, event: AstrMessageEvent):
+        """拦截「候选选择」的回复：只有该会话有待选候选、且文本是序号/取消时才响应，
+        处理完直接终止事件传播，避免再被 LLM 或其它插件接走。"""
+        try:
+            text = (event.message_str or "").strip()
+            if not text or text[0] in "/!！":
+                return  # 指令交给 cmd_video 处理
+            if not self._allowed(event):
+                return
+            if await self._try_handle_selection(event, text):
+                event.stop_event()
+        except Exception as e:
+            logger.error(f"[mailvideo] 候选选择处理异常: {e}")
 
     @filter.command("搜片")
     async def cmd_video(self, event: AstrMessageEvent):
@@ -184,10 +243,19 @@ class MailVideoPlugin(Star):
                 "/搜片 <关键词>   搜索并回传视频\n"
                 "/搜片 地址        获取并缓存站点地址\n"
                 "/搜片 邮箱        测试邮箱连接\n"
+                "/搜片 取消        取消待选的候选\n"
                 "/搜片 帮助        显示本帮助\n"
                 f"\n当前缓存站点地址：{cached}\n"
                 "首次使用请先在插件配置中填写邮箱账号、授权码与收件邮箱。"
             )
+            return
+
+        # ── 子指令：/搜片 取消 ──
+        if kw in ("取消", "放弃", "cancel"):
+            if self.store.pop_selection(event.unified_msg_origin):
+                yield event.plain_result("已取消本次候选选择。")
+            else:
+                yield event.plain_result("当前没有待选择的候选。")
             return
 
         # ── 主流程：/搜片 <关键词> ──
@@ -195,8 +263,13 @@ class MailVideoPlugin(Star):
             yield event.plain_result(
                 "用法：/搜片 <关键词>\n例如：/搜片 鞠婧祎\n\n"
                 "子指令：\n/搜片 地址   获取站点地址\n"
-                "/搜片 邮箱   测试邮箱连接\n/搜片 帮助   显示帮助"
+                "/搜片 邮箱   测试邮箱连接\n/搜片 取消   取消候选选择\n"
+                "/搜片 帮助   显示帮助"
             )
+            return
+
+        # 该会话正等待选择时，/搜片 3 也视作「选了第 3 个候选」
+        if await self._try_handle_selection(event, keyword):
             return
 
         umo = event.unified_msg_origin
@@ -213,7 +286,9 @@ class MailVideoPlugin(Star):
         yield event.plain_result(
             f"\u200b🔍 收到，开始处理「{keyword}」\n① 正在获取站点地址…"
         )
-        task = asyncio.create_task(self._run_pipeline(umo, keyword, lock))
+        task = asyncio.create_task(
+            self._run_pipeline(umo, keyword, lock, event.get_sender_id())
+        )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -231,9 +306,10 @@ class MailVideoPlugin(Star):
             logger.error(f"[mailvideo] 取地址失败: {e}")
             await self._send_text(umo, f"❌ 取地址失败：{e}")
 
-    async def _run_pipeline(self, umo: str, keyword: str, lock: asyncio.Lock):
+    async def _run_pipeline(
+        self, umo: str, keyword: str, lock: asyncio.Lock, sender_id: str = ""
+    ):
         async with lock:
-            tmp_dir = self.store.temp_dir / f"job_{int(time.time())}"
             try:
                 # ---- ① 取地址 ----
                 address, _ = await self._fetch_address(umo)
@@ -249,89 +325,228 @@ class MailVideoPlugin(Star):
                     await self._send_text(umo, "❌ 未搜索到相关视频。", critical=True)
                     return
 
+                # ---- ③ 列出候选，等用户回复序号后再下载那一个 ----
+                await self._send_candidate_list(
+                    umo, keyword, address, candidates, sender_id
+                )
+            except Exception as e:
+                logger.error(f"[mailvideo] 处理失败: {e}", exc_info=True)
+                await self._send_text(umo, f"❌ 处理失败：{e}")
+
+    async def _download_one(
+        self,
+        umo: str,
+        fetcher,
+        cand: dict,
+        tmp_dir: Path,
+        max_size_mb: int,
+        tag: str = "",
+    ) -> tuple[bool, str]:
+        """下载单个候选并回传，返回 (是否已处理, 错误信息)。"""
+        url = cand.get("url") or ""
+        # 压缩开启且阈值为 0 时，让 HLS 下载在合并阶段顺带完成压缩，
+        # 省掉一份完整体积的中转文件和一次全量读写。
+        encode_opts = self._fused_encode_opts(fetcher)
+        _dl_started = time.time()
+        try:
+            result = await asyncio.to_thread(
+                fetcher.download,
+                url,
+                tmp_dir,
+                max_size_mb,
+                cand.get("title") or "",
+                encode_opts,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[mailvideo] —— 下载失败（耗时 {time.time() - _dl_started:.1f}s）{url}: {e}"
+            )
+            return False, str(e)
+
+        dl_seconds = time.time() - _dl_started
+        path = Path(result["path"])
+        size_mb = path.stat().st_size / 1024 / 1024
+        logger.info(
+            f"[mailvideo] —— 下载成功 —— {path.name} | {size_mb:.2f}MB | "
+            f"耗时 {dl_seconds:.1f}s"
+        )
+
+        # ---- ⓸b 画质压缩（可选）----
+        # HLS 路径若已在合并阶段顺带编码，这里直接跳过，避免压两遍。
+        cp_seconds = 0.0
+        if result.get("pre_encoded"):
+            logger.info("[mailvideo] —— 已在下载合并阶段顺带压缩，跳过独立压缩")
+        else:
+            _cp_started = time.time()
+            path, size_mb = await self._maybe_compress(umo, fetcher, path, size_mb, tmp_dir)
+            cp_seconds = time.time() - _cp_started
+
+        if size_mb > max_size_mb:
+            await self._send_text(
+                umo,
+                f"⚠️ 文件过大（{size_mb:.1f}MB > {max_size_mb}MB），"
+                f"改为返回链接：\n{result.get('webpage_url') or url}",
+                critical=True,
+            )
+            return True, ""
+
+        suffix = f"（{tag}）" if tag else ""
+        _send_started = time.time()
+        ok = await self._send_video(umo, path)
+        send_seconds = time.time() - _send_started
+        if ok:
+            logger.info(f"[mailvideo] 已回传视频{suffix}: {path.name}")
+        else:
+            logger.info(f"[mailvideo] 视频已转为待投递{suffix}: {path.name}")
+        logger.info(
+            f"[mailvideo] ⏱️ 本次耗时明细 | 下载 {dl_seconds:.1f}s"
+            + (f" | 压缩 {cp_seconds:.1f}s" if cp_seconds else "")
+            + f" | 发送 {send_seconds:.1f}s"
+            + f" | 合计 {dl_seconds + cp_seconds + send_seconds:.1f}s"
+            + f" | 最终体积 {size_mb:.2f}MB"
+        )
+        return True, ""
+
+    # ================================================================== #
+    # 候选选择模式（列出候选 → 用户回复序号 → 只下载那一条）
+    # ================================================================== #
+    @staticmethod
+    def _cand_title(cand: dict, idx: int = 0) -> str:
+        """候选的展示标题：优先标题，退而用 URL，最后兜底编号。"""
+        title = str(cand.get("title") or "").strip()
+        url = str(cand.get("url") or "").strip()
+        if not title or title == url:
+            title = re.sub(r"^https?://", "", url)
+        title = title.strip()
+        if not title:
+            title = f"候选 {idx}" if idx else "未命名"
+        return title[:60]
+
+    async def _send_candidate_list(
+        self,
+        umo: str,
+        keyword: str,
+        address: str,
+        candidates: list,
+        sender_id: str = "",
+    ) -> None:
+        """搜索完成后不立即下载，先把候选编号列出，等用户回复序号。"""
+        shown = list(candidates[: self._select_max()])
+        timeout = self._select_timeout()
+        lines = [
+            f"\u200b📋 「{keyword}」共找到 {len(candidates)} 个候选，回复序号选择：",
+            "",
+        ]
+        for i, cand in enumerate(shown, 1):
+            lines.append(f"{i}. {self._cand_title(cand, i)}")
+        lines.append("")
+        lines.append(
+            f"回复数字即可（如「3」）· 回复「取消」放弃 · {timeout} 秒内有效"
+        )
+        self.store.set_selection(
+            umo,
+            {
+                "keyword": keyword,
+                "address": address,
+                "candidates": shown,
+                "sender_id": str(sender_id or ""),
+            },
+        )
+        await self._send_text(umo, "\n".join(lines))
+        logger.info(f"[mailvideo] 已列出 {len(shown)}/{len(candidates)} 个候选，等待选择: {umo}")
+
+    async def _try_handle_selection(self, event: AstrMessageEvent, text: str) -> bool:
+        """若该会话有待选候选且本条消息是有效选择，处理它并返回 True。"""
+        umo = event.unified_msg_origin
+        session = self.store.get_selection(umo)
+        if not session:
+            return False
+
+        owner = str(session.get("sender_id") or "")
+        sender = str(event.get_sender_id() or "")
+        if owner and sender and owner != sender:
+            return False  # 群聊里只认发起者本人的回复
+
+        norm = re.sub(r"\s+", "", text or "")
+        if not norm:
+            return False
+
+        if norm.lower() in _CANCEL_WORDS:
+            self.store.pop_selection(umo)
+            await self._send_text(umo, "已取消本次候选选择。")
+            return True
+
+        m = _SELECT_RE.fullmatch(norm)
+        if not m:
+            return False
+
+        if time.time() - int(session.get("ts", 0) or 0) > self._select_timeout():
+            self.store.pop_selection(umo)
+            await self._send_text(umo, "⏳ 候选列表已超时失效，请重新发送 /搜片 <关键词>。")
+            return True
+
+        cands = list(session.get("candidates") or [])
+        idx = int(m.group(1))
+        if not (1 <= idx <= len(cands)):
+            await self._send_text(
+                umo,
+                f"❌ 序号超出范围，请回复 1-{len(cands)} 之间的数字（或回复「取消」）。",
+            )
+            return True
+
+        # 先弹出会话，避免重复点选造成重复下载；下载失败会在任务里放回
+        self.store.pop_selection(umo)
+        await self._send_text(
+            umo,
+            f"· 已选择第 {idx} 个：{self._cand_title(cands[idx - 1], idx)}\n④ 开始下载…",
+        )
+        task = asyncio.create_task(self._run_selection(umo, session, idx - 1))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return True
+
+    async def _run_selection(self, umo: str, session: dict, index: int) -> None:
+        """下载用户选中的那一个候选并回传；失败则把候选列表放回去让用户换一个。"""
+        cands = list(session.get("candidates") or [])
+        if not (0 <= index < len(cands)):
+            return
+        cand = cands[index]
+
+        lock = self._locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[umo] = lock
+
+        async with lock:
+            tmp_dir = self.store.temp_dir / f"job_{int(time.time())}"
+            try:
+                fetcher = self._build_fetcher()
                 if not fetcher.ffmpeg_available():
                     await self._send_text(
                         umo, "⚠️ 未检测到 ffmpeg，m3u8 合并/高清合流可能失败，将尽量尝试。"
                     )
-
-                # ---- ③ 下载 ----
-                max_results = max(1, int(self._cfg("max_results", 1) or 1))
                 max_size_mb = max(1, int(self._cfg("max_video_size_mb", 100) or 100))
-                # 最多尝试的候选数：回传数 + 少量容错，避免无脑刷 6 个
-                max_attempts = max(1, int(self._cfg("max_download_attempts", 0) or 0))
-                if max_attempts <= 0:
-                    max_attempts = max_results + 1
-                got = 0
-                attempts = 0
-                errors: list[str] = []
-                for cand in candidates:
-                    if got >= max_results or attempts >= max_attempts:
-                        break
-                    attempts += 1
-                    url = cand["url"]
-                    logger.info(
-                        f"[mailvideo] —— 开始第 {attempts}/{max_attempts} 次下载 —— "
-                        f"标题: {cand.get('title')} | 页面: {url}"
-                    )
-                    await self._send_text(
-                        umo,
-                        f"④ 正在下载（{attempts}/{max_attempts}）：{cand.get('title') or url}",
-                    )
-                    _dl_started = time.time()
-                    try:
-                        result = await asyncio.to_thread(
-                            fetcher.download,
-                            url,
-                            tmp_dir,
-                            max_size_mb,
-                            cand.get("title") or "",
-                        )
-                    except Exception as e:
-                        errors.append(str(e))
-                        logger.warning(
-                            f"[mailvideo] —— 下载失败（耗时 {time.time() - _dl_started:.1f}s）"
-                            f"{url}: {e}"
-                        )
-                        continue
-
-                    path = Path(result["path"])
-                    size_mb = path.stat().st_size / 1024 / 1024
-                    logger.info(
-                        f"[mailvideo] —— 下载成功 —— {path.name} | {size_mb:.2f}MB | "
-                        f"耗时 {time.time() - _dl_started:.1f}s"
-                    )
-
-                    # ---- ⓸b 画质压缩（可选）----
-                    path, size_mb = await self._maybe_compress(
-                        umo, fetcher, path, size_mb, tmp_dir
-                    )
-
-                    if size_mb > max_size_mb:
-                        await self._send_text(
-                            umo,
-                            f"⚠️ 文件过大（{size_mb:.1f}MB > {max_size_mb}MB），"
-                            f"改为返回链接：\n{result.get('webpage_url') or url}",
-                            critical=True,
-                        )
-                        got += 1
-                        continue
-                    ok = await self._send_video(umo, path)
-                    got += 1
-                    if ok:
-                        logger.info(f"[mailvideo] 已回传第 {got} 个视频: {path.name}")
-                    else:
-                        logger.info(f"[mailvideo] 第 {got} 个视频已转为待投递: {path.name}")
-
-                if got == 0:
-                    detail = ("；".join(errors[-2:])) if errors else "无可用结果"
-                    await self._send_text(umo, f"❌ 下载失败：{detail}", critical=True)
-                else:
-                    logger.info(
-                        f"[mailvideo] 任务结束 | 成功回传 {got} 个 | 尝试 {attempts} 次"
-                        + (f" | 失败 {len(errors)} 次" if errors else "")
-                    )
+                label = self._cand_title(cand, index + 1)
+                logger.info(
+                    f"[mailvideo] —— 选择模式下载第 {index + 1} 个 —— "
+                    f"{label} | {cand.get('url')}"
+                )
+                handled, err = await self._download_one(
+                    umo, fetcher, cand, tmp_dir, max_size_mb, tag="选择"
+                )
+                if handled:
+                    logger.info(f"[mailvideo] 选择模式回传成功: {label}")
+                    return
+                await self._send_text(
+                    umo,
+                    f"❌ 第 {index + 1} 个下载失败：{err}\n"
+                    "可回复其它序号重试，或回复「取消」放弃。",
+                    critical=True,
+                )
+                # 失败：恢复候选列表，允许换个序号重试
+                self.store.set_selection(umo, {**session, "candidates": cands})
             except Exception as e:
-                logger.error(f"[mailvideo] 处理失败: {e}", exc_info=True)
+                logger.error(f"[mailvideo] 选择模式下载失败: {e}", exc_info=True)
                 await self._send_text(umo, f"❌ 处理失败：{e}")
             finally:
                 self._cleanup(tmp_dir)
@@ -415,21 +630,60 @@ class MailVideoPlugin(Star):
         刷新窗口），仍失败则暂存为「待投递」，等用户下次发消息时补发。
         """
         send_as = str(self._cfg("send_as", "video") or "video").lower()
+        try:
+            size_mb = path.stat().st_size / 1024 / 1024
+        except OSError:
+            size_mb = 0.0
+        desc = f"{path.name} | {size_mb:.2f}MB"
+        send_started = time.time()
         for attempt in range(1, 4):
+            logger.info(f"[mailvideo] 📤 开始发送（第 {attempt}/3 次）：{desc}")
+            _t0 = time.time()
+            # 心跳：send_msg 整包传完才返回，中间没有任何进度回调，
+            # 这里在等待期间定期打日志，避免看起来“卡死”。
+            hb = asyncio.create_task(self._send_heartbeat(desc, attempt, _t0))
             try:
                 if send_as == "file":
                     chain = MessageChain([Comp.File(file=str(path), name=path.name)])
                 else:
                     chain = MessageChain([Comp.Video.fromFileSystem(path=str(path))])
                 await self.context.send_message(umo, chain)
+                logger.info(
+                    f"[mailvideo] ✅ 发送成功（第 {attempt}/3 次）：{desc} | "
+                    f"单次耗时 {time.time() - _t0:.1f}s | 累计 {time.time() - send_started:.1f}s"
+                )
                 return True
             except Exception as e:
-                logger.warning(f"[mailvideo] 发送视频失败（第 {attempt}/3 次）: {e}")
+                logger.warning(
+                    f"[mailvideo] ❌ 发送失败（第 {attempt}/3 次）：{desc} | "
+                    f"耗时 {time.time() - _t0:.1f}s | {e}"
+                )
                 if attempt < 3:
                     await asyncio.sleep(20)
+            finally:
+                hb.cancel()
         # 重试全部失败：暂存待投递，等用户下次发消息时补发
+        logger.warning(f"[mailvideo] 📥 发送重试耗尽，转待投递：{desc}")
         self._stash_pending(umo, {"type": "video", "path": str(path), "name": path.name})
         return False
+
+    async def _send_heartbeat(self, desc: str, attempt: int, t0: float) -> None:
+        """发送等待期间定期写日志，替代 QQ/OneBot 缺失的上传进度回调。
+
+        OneBot 的 send_msg / upload_group_file 属于一次性 RPC：整包上传完成
+        才返回结果，中途不会回调进度。所以这里用心跳把「已等待多久」写进
+        日志，至少能区分「在传」和「卡死」。
+        """
+        interval = max(1, int(self._cfg("send_heartbeat_interval", 5) or 5))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                logger.info(
+                    f"[mailvideo] ⏳ 发送中（第 {attempt}/3 次）：{desc} | "
+                    f"已等待 {time.time() - t0:.0f}s（等待平台上传返回）"
+                )
+        except asyncio.CancelledError:
+            pass
 
     # ================================================================== #
     # 待投递（发送失败兜底，应对平台主动消息限制）

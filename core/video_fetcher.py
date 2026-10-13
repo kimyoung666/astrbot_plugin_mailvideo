@@ -73,6 +73,8 @@ class VideoFetcher:
         timeout: int = 30,
         download_timeout: int = 1800,
         hls_parallel_workers: int = 16,
+        direct_parallel_workers: int = 8,
+        direct_parallel_min_mb: int = 4,
     ) -> None:
         self.search_url_template = search_url_template or "{base}/search?wd={keyword}"
         self.max_results = max(1, int(max_results))
@@ -89,6 +91,10 @@ class VideoFetcher:
         self.progress_interval = 3.0
         # HLS 并行下载线程数（0 = 禁用并行，走 ffmpeg 串行）
         self.hls_parallel_workers = max(0, int(hls_parallel_workers or 0))
+        # 直链（单文件 mp4/flv 等）多连接 Range 并发下载
+        self.direct_parallel_workers = max(0, int(direct_parallel_workers or 0))
+        # 小于该体积的直链不做分片并发（小文件分段反而更慢）
+        self.direct_parallel_min_mb = max(1, int(direct_parallel_min_mb or 4))
 
     # ============================================================== #
     # 工具
@@ -309,11 +315,17 @@ class VideoFetcher:
         dest_dir: Path,
         max_size_mb: int = 0,
         title: str = "",
+        encode_opts: Optional[dict] = None,
     ) -> dict:
         """下载单个视频，返回 ``{"path": str, "title": str, "webpage_url": str}``。
 
         ``max_size_mb`` > 0 时启用**预检**：先读取 m3u8 播放列表估算体积，
         超限则直接抛错，避免把几百 MB 甚至 1GB 的内容白下完再丢弃。
+
+        ``encode_opts`` 传入压缩参数（target_height/crf/preset/target_bitrate/
+        audio_bitrate）时，HLS 路径会把「合并」与「压缩」合成一次 ffmpeg 调用，
+        不再落一份完整体积的中转 mp4。成功时返回值带 ``pre_encoded=True``，
+        调用方据此跳过后续独立的压缩步骤。
         """
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -366,7 +378,8 @@ class VideoFetcher:
                 logger.info(f"[mailvideo] 走并行下载（{self.hls_parallel_workers} 线程）")
                 try:
                     return self._download_hls_parallel(
-                        media_url, dest_dir, referer=url, title=page_title
+                        media_url, dest_dir, referer=url, title=page_title,
+                        encode_opts=encode_opts,
                     )
                 except Exception as e:
                     last_err = e
@@ -430,11 +443,14 @@ class VideoFetcher:
         dest_dir: Path,
         referer: str = "",
         title: str = "",
+        encode_opts: Optional[dict] = None,
     ) -> dict:
         """并行下载 HLS 分片 + ffmpeg 合并。
 
         支持 AES-128 加密：下载密钥后生成本地 m3u8，
         ffmpeg 自动解密 + 合并。实测 16 线程对比单流提速 ~8-10x。
+
+        传入 ``encode_opts`` 时，合并阶段直接出压缩产物，不再落中转文件。
         """
         import concurrent.futures
         import urllib.parse as _urlparse
@@ -619,26 +635,28 @@ class VideoFetcher:
             f.write("#EXT-X-ENDLIST\n")  # 必须！否则 ffmpeg 当直播流无限等下一片
 
         # ── 7) ffmpeg 合并（自动解密）──
-        cmd = [
-            shutil.which("ffmpeg") or "ffmpeg",
-            "-y", "-nostdin", "-v", "warning",
-            "-allowed_extensions", "ALL",
-            "-i", str(local_m3u8),
-            "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            "-movflags", "+faststart",
-            str(out),
-        ]
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=120, stdin=subprocess.DEVNULL,
-        )
-        if proc.returncode != 0:
+        # encode_opts 存在时：合并与压缩合成一次调用，不再落一份完整体积的中转 mp4。
+        # 编码失败会自动回退到原来的 -c copy 纯合并，不会让整个下载任务白费。
+        pre_encoded = False
+        try:
+            if encode_opts:
+                try:
+                    logger.info("[mailvideo] 合并 + 压缩一次完成（省掉中转文件）")
+                    self._mux_local_playlist(local_m3u8, out, encode_opts=encode_opts)
+                    pre_encoded = True
+                except Exception as e:
+                    logger.warning(f"[mailvideo] 合并+压缩失败，回退纯合并: {e}")
+                    try:
+                        out.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if not pre_encoded:
+                self._mux_local_playlist(local_m3u8, out)
+        except Exception:
             shutil.rmtree(seg_dir, ignore_errors=True)
             if key_file:
                 key_file.unlink(missing_ok=True)
-            raise VideoFetchError(
-                f"ffmpeg 合并失败: {proc.stderr[-300:]}"
-            )
+            raise
 
         # ── 8) 清理 ──
         shutil.rmtree(seg_dir, ignore_errors=True)
@@ -648,17 +666,127 @@ class VideoFetcher:
         if not out.exists() or out.stat().st_size == 0:
             raise VideoFetchError("合并后文件为空")
 
+        size_bytes = out.stat().st_size
         logger.info(
             f"[mailvideo] ✅ 并行下载完成 {out.name} | "
-            f"{out.stat().st_size/1024/1024:.2f}MB | "
+            f"{size_bytes/1024/1024:.2f}MB | "
             f"总耗时 {time.time()-start:.1f}s"
+            + ("（合并时已顺带压缩）" if pre_encoded else "")
         )
         return {
             "path": str(out),
             "title": out.stem,
             "webpage_url": final_url,
-            "filesize": out.stat().st_size,
+            "filesize": size_bytes,
+            "pre_encoded": pre_encoded,
+            "downloaded_bytes": total[0],
         }
+
+    def _mux_local_playlist(
+        self, local_m3u8: Path, out: Path, encode_opts: Optional[dict] = None
+    ) -> None:
+        """把本地 m3u8（含密钥指令）合并为 mp4。
+
+        - 不带 ``encode_opts``：``-c copy`` 纯封装，最快；
+        - 带 ``encode_opts``：同一趟里完成转码压缩，省掉一次全量中转读写。
+
+        ``encode_opts`` 支持 target_height / crf / preset / target_bitrate /
+        audio_bitrate，与 ``compress_video`` 的配置项同名同义。
+        """
+        base = [
+            self._ffmpeg_bin(), "-y", "-nostdin", "-v", "warning",
+            "-allowed_extensions", "ALL",
+            "-i", str(local_m3u8),
+        ]
+
+        if encode_opts:
+            target_h = int(encode_opts.get("target_height") or 0)
+            vf: list[str] = []
+            if target_h > 0:
+                # 用表达式等比缩放且不放大，省掉一次 ffprobe 探测
+                vf.append(f"scale=-2:'min(ih,{target_h})'")
+            vf.extend(["format=yuv420p", "setsar=1"])
+
+            cmd = base + [
+                "-vf", ",".join(vf),
+                "-c:v", "libx264",
+                "-preset", str(encode_opts.get("preset") or "veryfast"),
+            ]
+            bitrate = str(encode_opts.get("target_bitrate") or "").strip()
+            if bitrate:
+                cmd += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", "2M"]
+            else:
+                try:
+                    crf = int(encode_opts.get("crf") or 30)
+                except (TypeError, ValueError):
+                    crf = 30
+                cmd += ["-crf", str(crf)]
+            cmd += [
+                "-c:a", "aac",
+                "-b:a", str(encode_opts.get("audio_bitrate") or "64k"),
+                "-ac", "2",
+                "-movflags", "+faststart",
+                "-progress", "pipe:1", "-nostats",
+                str(out),
+            ]
+            timeout = self.download_timeout
+        else:
+            cmd = base + [
+                "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart",
+                str(out),
+            ]
+            timeout = 120
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE if encode_opts else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        err_lines: list[str] = []
+        threading.Thread(
+            target=self._drain_stderr, args=(proc, err_lines), daemon=True
+        ).start()
+
+        start = time.time()
+        last_log = 0.0
+        out_time_s = 0.0
+        speed_x = 0.0
+        try:
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    line = raw.strip()
+                    if line.startswith("out_time_ms="):
+                        try:
+                            out_time_s = int(line.split("=", 1)[1]) / 1_000_000
+                        except ValueError:
+                            continue
+                        now = time.time()
+                        if now - last_log >= self.progress_interval:
+                            last_log = now
+                            self._log_compress_progress(
+                                out, out_time_s, 0.0, start, speed_x,
+                                "⏳ 合并+压缩中",
+                            )
+                    elif line.startswith("speed="):
+                        try:
+                            speed_x = float(line.split("=", 1)[1].replace("x", ""))
+                        except ValueError:
+                            pass
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise VideoFetchError(f"ffmpeg 合并超时（>{timeout}s）")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        if proc.returncode != 0:
+            tail = [l.strip() for l in err_lines if l.strip()][-3:]
+            raise VideoFetchError("ffmpeg 合并失败: " + " | ".join(tail))
 
 
     def _download_via_ffmpeg(
@@ -1157,6 +1285,12 @@ class VideoFetcher:
         return None
 
     def _download_direct(self, url: str, dest_dir: Path, headers: Optional[dict] = None) -> dict:
+        """直链下载（单文件 mp4/flv/mkv 等）。
+
+        服务端支持 ``Range`` 且文件够大时改用**多连接分段并发**，各段按偏移
+        直接写入同一文件，不再额外拼接一遍。探测或分段失败都会自动退回原来
+        的单连接流式下载，不会让任务失败。
+        """
         import httpx
 
         name = Path(urlparse(url).path).name or "video.mp4"
@@ -1167,8 +1301,46 @@ class VideoFetcher:
         if not name.lower().endswith(_MEDIA_EXT):
             name += ".mp4"
         out = Path(dest_dir) / name
+        hdrs = dict(headers or self._http_headers())
+        start = time.time()
+
+        # ── 1) 探测体积与 Range 支持（多连接分段的前提）──
+        if self.direct_parallel_workers > 1:
+            total = 0
+            try:
+                total, ranges_ok = self._probe_range_support(url, hdrs)
+            except Exception as e:
+                logger.debug(f"[mailvideo] Range 探测失败（忽略）: {e}")
+                total, ranges_ok = 0, False
+
+            if ranges_ok and total >= self.direct_parallel_min_mb * 1024 * 1024:
+                try:
+                    logger.info(
+                        f"[mailvideo] 直链走多连接分段下载（"
+                        f"{self.direct_parallel_workers} 连接 / {self._human_size(total)}）"
+                    )
+                    self._download_ranges(url, out, hdrs, total)
+                    logger.info(
+                        f"[mailvideo] ✅ 分段下载完成 {name} | "
+                        f"{self._human_size(out.stat().st_size)} | "
+                        f"耗时 {time.time() - start:.1f}s"
+                    )
+                    return {
+                        "path": str(out),
+                        "title": out.stem,
+                        "webpage_url": url,
+                        "filesize": out.stat().st_size,
+                    }
+                except Exception as e:
+                    logger.warning(f"[mailvideo] 分段下载失败，回退单连接: {e}")
+                    try:
+                        out.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+        # ── 2) 单连接流式下载（原有逻辑，作为兜底）──
         with httpx.Client(
-            headers=headers or self._http_headers(),
+            headers=hdrs,
             timeout=None,
             follow_redirects=True,
             proxy=self._proxy_arg(),
@@ -1184,7 +1356,6 @@ class VideoFetcher:
                     + (f"（{self._human_size(total)}）" if total else "")
                 )
                 done = 0
-                start = _t0 = time.time()
                 last_log = 0.0
                 with open(out, "wb") as f:
                     for chunk in resp.iter_bytes(chunk_size=1024 * 256):
@@ -1205,9 +1376,137 @@ class VideoFetcher:
             raise VideoFetchError("直链下载得到空文件")
         logger.info(
             f"[mailvideo] ✅ 下载完成 {name} | {self._human_size(out.stat().st_size)} "
-            f"| 耗时 {time.time() - locals().get('_t0', time.time()):.1f}s"
+            f"| 耗时 {time.time() - start:.1f}s"
         )
         return {"path": str(out), "title": out.stem, "webpage_url": url, "filesize": out.stat().st_size}
+
+    def _probe_range_support(self, url: str, headers: dict) -> tuple[int, bool]:
+        """用 ``Range: bytes=0-0`` 探测服务端是否支持分段，返回 (总字节数, 是否支持)。"""
+        import httpx
+
+        hdrs = dict(headers)
+        hdrs["Range"] = "bytes=0-0"
+        with httpx.Client(
+            timeout=self.timeout,
+            follow_redirects=True,
+            proxy=self._proxy_arg(),
+        ) as client:
+            with client.stream("GET", url, headers=hdrs) as resp:
+                resp.raise_for_status()
+                if resp.status_code == 206:
+                    m = re.search(
+                        r"/(\d+)\s*$", resp.headers.get("Content-Range") or ""
+                    )
+                    if m:
+                        return int(m.group(1)), True
+                    return 0, False
+                # 返回 200 说明服务端忽略了 Range → 不支持分段
+                try:
+                    return int(resp.headers.get("Content-Length") or 0), False
+                except (TypeError, ValueError):
+                    return 0, False
+
+    def _download_ranges(self, url: str, out: Path, headers: dict, total: int) -> None:
+        """多连接分段下载并写入同一文件。任一段最终失败则整体抛错。"""
+        import concurrent.futures
+
+        workers = max(1, min(self.direct_parallel_workers, 32))
+        # 分段太小反而更慢：每段至少 1MB，不够就减少连接数
+        while workers > 1 and -(-total // workers) < 1024 * 1024:
+            workers -= 1
+
+        part = -(-total // workers)  # 向上取整
+        ranges: list[tuple[int, int]] = []
+        pos = 0
+        while pos < total:
+            end = min(pos + part - 1, total - 1)
+            ranges.append((pos, end))
+            pos = end + 1
+
+        # 预分配，保证各段能按偏移直接写入
+        with open(out, "wb") as f:
+            f.truncate(total)
+
+        lock = threading.Lock()
+        done = [0]
+        progress = {"bytes": 0}
+        errors: list[str] = []
+        start = time.time()
+
+        def _worker(idx: int, rng: tuple[int, int]) -> bool:
+            s, e = rng
+            expect = e - s + 1
+            last_err = ""
+            for attempt in range(3):
+                try:
+                    got = self._fetch_range(url, out, headers, s, e, progress, lock)
+                    if got != expect:
+                        raise IOError(f"分段长度不符（收到 {got}，应为 {expect}）")
+                    with lock:
+                        done[0] += 1
+                    return True
+                except Exception as ex:
+                    last_err = str(ex)
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+            errors.append(f"段{idx}({s}-{e}): {last_err}")
+            return False
+
+        logger.info(f"[mailvideo] 分段下载 {len(ranges)} 段（{workers} 连接）…")
+        last_log = start
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_worker, i, rng) for i, rng in enumerate(ranges)]
+            for _ in concurrent.futures.as_completed(futures):
+                now = time.time()
+                if now - last_log >= self.progress_interval:
+                    last_log = now
+                    elapsed = max(now - start, 0.001)
+                    got = progress["bytes"]
+                    logger.info(
+                        f"[mailvideo] ⏳ 分段下载 {done[0]}/{len(ranges)} 段 | "
+                        f"{self._human_size(got)}/{self._human_size(total)} | "
+                        f"{self._human_size(got / elapsed)}/s | {elapsed:.1f}s"
+                    )
+
+        if errors:
+            raise VideoFetchError(f"{len(errors)}/{len(ranges)} 段下载失败: {errors[:3]}")
+        if progress["bytes"] != total:
+            raise VideoFetchError(
+                f"分段下载字节数不符（{progress['bytes']} != {total}）"
+            )
+
+    def _fetch_range(
+        self,
+        url: str,
+        out: Path,
+        headers: dict,
+        start_byte: int,
+        end_byte: int,
+        progress: dict,
+        lock: "threading.Lock",
+    ) -> int:
+        """下载 ``[start_byte, end_byte]`` 并写入 ``out`` 的对应偏移，返回写入字节数。"""
+        import httpx
+
+        hdrs = dict(headers)
+        hdrs["Range"] = f"bytes={start_byte}-{end_byte}"
+        written = 0
+        with httpx.Client(
+            timeout=None,
+            follow_redirects=True,
+            proxy=self._proxy_arg(),
+        ) as client:
+            with client.stream("GET", url, headers=hdrs) as resp:
+                if resp.status_code != 206:
+                    raise IOError(f"服务端未按 Range 返回（HTTP {resp.status_code}）")
+                with open(out, "r+b") as f:
+                    f.seek(start_byte)
+                    for chunk in resp.iter_bytes(chunk_size=1024 * 256):
+                        f.write(chunk)
+                        written += len(chunk)
+                        with lock:
+                            progress["bytes"] += len(chunk)
+        return written
 
     # ============================================================== #
     # 基础配置
@@ -1220,10 +1519,14 @@ class VideoFetcher:
             "quiet": True,
             "no_warnings": True,
             "concurrent_fragment_downloads": max(1, self.hls_parallel_workers),
+            # 分片下载并发（HLS/DASH）。
             "nocheckcertificate": True,
             "retries": 3,
             "fragment_retries": 3,
             "socket_timeout": self.timeout,
+            # 大文件按块拉取，单连接也能跑满带宽；yt-dlp 会校验总长度并自动重试。
+            "http_chunk_size": 10 * 1024 * 1024,
+            "buffersize": 1024 * 1024,
             "http_headers": self._http_headers(),
         }
         if self.proxy:
