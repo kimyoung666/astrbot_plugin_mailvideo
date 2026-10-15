@@ -94,7 +94,7 @@ _SELECT_RE = re.compile(r"^(?:选|选择|第)?[#＃]?(\d{1,2})(?:号|个|条)?$"
 _CANCEL_WORDS = {"取消", "算了", "放弃", "不要了", "不用了", "退出", "cancel", "q"}
 
 
-@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.1",
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.2",
           "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -136,10 +136,52 @@ class MailVideoPlugin(Star):
             cookie=str(self._cfg("cookie", "") or ""),
             proxy=str(self._cfg("http_proxy", "") or ""),
             ffmpeg_path=str(self._cfg("ffmpeg_path", "") or ""),
-            hls_parallel_workers=int(self._cfg("hls_parallel_workers", 16) or 16),
-            direct_parallel_workers=int(self._cfg("direct_parallel_workers", 8) or 0),
+            hls_parallel_workers=int(self._cfg("hls_parallel_workers", 24) or 24),
+            direct_parallel_workers=int(self._cfg("direct_parallel_workers", 12) or 0),
             direct_parallel_min_mb=int(self._cfg("direct_parallel_min_mb", 4) or 4),
+            # 媒体域名分流：站点页面恒走代理，视频 CDN 自动判定直连/代理
+            proxy_bypass_hosts=str(self._cfg("proxy_bypass_hosts", "") or ""),
+            proxy_force_hosts=str(self._cfg("proxy_force_hosts", "") or ""),
+            auto_probe_direct=bool(self._cfg("auto_probe_direct", True)),
+            probe_timeout=int(self._cfg("probe_timeout", 5) or 5),
+            http2=bool(self._cfg("http2", True)),
         )
+
+    def _preferred_template(self, base: str) -> str:
+        """取该站点上次命中的搜索模板（没有则返回空串）。"""
+        try:
+            m = self.store.get("search_template_ok", {}) or {}
+            if not isinstance(m, dict):
+                return ""
+            return str(m.get(self._host_of(base), "") or "")
+        except Exception:
+            return ""
+
+    def _remember_template(self, base: str, hit: dict) -> None:
+        """记住本次命中的搜索模板；下次跳过已知不可用的模板。"""
+        tpl = str((hit or {}).get("template") or "")
+        if not tpl:
+            return
+        try:
+            m = self.store.get("search_template_ok", {}) or {}
+            if not isinstance(m, dict):
+                m = {}
+            m[self._host_of(base)] = tpl
+            if len(m) > 20:  # 只留最近 20 个站点
+                m = dict(list(m.items())[-20:])
+            self.store.set("search_template_ok", m)
+            logger.info(f"[mailvideo] 记录搜索模板偏好: {self._host_of(base)} -> {tpl}")
+        except Exception as e:
+            logger.debug(f"[mailvideo] 记录搜索模板偏好失败（忽略）: {e}")
+
+    @staticmethod
+    def _host_of(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+
+            return (urlparse(url).hostname or url or "").lower()
+        except Exception:
+            return url or ""
 
     def _fused_encode_opts(self, fetcher) -> Optional[dict]:
         """决定是否把「压缩」提前到下载的合并阶段一趟完成。
@@ -323,7 +365,10 @@ class MailVideoPlugin(Star):
                 # ---- ② 搜索 ----
                 await self._send_text(umo, f"② 站点地址：{address}\n③ 正在搜索「{keyword}」…")
                 fetcher = self._build_fetcher()
-                candidates = await asyncio.to_thread(fetcher.search, address, keyword)
+                candidates, hit = await asyncio.to_thread(
+                    fetcher.search_with_meta, address, keyword, self._preferred_template(address)
+                )
+                self._remember_template(address, hit)
                 if not candidates:
                     await self._send_text(umo, "❌ 未搜索到相关视频。", critical=True)
                     return

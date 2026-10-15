@@ -134,6 +134,30 @@
     "default": "",
     "hint": "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
   },
+  "auto_probe_direct": {
+    "description": "【分流】媒体域名自动直连探测",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后：站点页面仍走代理，但视频 CDN（m3u8/分片/直链）会先直连试探 1KB，通了就直连、不通才走代理，并按域名记住结果。代理往往比 CDN 直连慢一个数量级，开启可显著提速。"
+  },
+  "proxy_bypass_hosts": {
+    "description": "【分流】强制直连的域名",
+    "type": "string",
+    "default": "",
+    "hint": "逗号/空格分隔。命中的域名一律不走代理（支持后缀匹配，填 hembed.com 可命中 vdownload-7.hembed.com）。仅在自动探测误判时手动指定。"
+  },
+  "proxy_force_hosts": {
+    "description": "【分流】强制走代理的域名",
+    "type": "string",
+    "default": "",
+    "hint": "逗号/空格分隔。命中的域名一律走代理，优先级高于自动探测与「强制直连」。用于视频 CDN 也被墙的站点。"
+  },
+  "probe_timeout": {
+    "description": "【分流】直连探测超时（秒）",
+    "type": "int",
+    "default": 5,
+    "hint": "判定一个媒体域名是否需要代理时，直连试探等待的最长时间。超过该时长未响应即判为被墙、走代理。"
+  },
   "ffmpeg_path": {
     "description": "ffmpeg 可执行文件路径（可选）",
     "type": "string",
@@ -210,20 +234,26 @@
   "hls_parallel_workers": {
     "description": "【下载】HLS 并行下载线程数（0=禁用并行）",
     "type": "int",
-    "default": 16,
-    "hint": "并行下载 m3u8 分片的线程数。实测 16 线程对比单流提速约 8-10 倍（2.6MB/s → 25MB/s）。填 0 禁用并行，回退到 ffmpeg 串行拉流。填 4-8 适合带宽较小的服务器。"
+    "default": 24,
+    "hint": "并行下载 m3u8 分片的线程数。全部请求共用一个连接池（池上限 = 线程数 × 2，keep-alive 30 秒），连接可复用后单连接开销大幅下降，所以默认从 16 提到 24：握手压力几乎不增，吞吐更高。若你的源站会限速/排队，再往下调（12-16）即可。填 0 禁用并行，回退到 ffmpeg 串行拉流。填 4-8 适合带宽较小的服务器。"
   },
   "direct_parallel_workers": {
     "description": "【下载】直链多连接数（0=禁用）",
     "type": "int",
-    "default": 8,
-    "hint": "单文件直链（mp4/flv/mkv）的分段并发连接数。仅当服务端支持 Range 且文件大于下面的阈值时生效；不支持 Range 的站点会自动退回单连接。小站建议 4-8，别开太大以免被限速或封 IP。"
+    "default": 12,
+    "hint": "单文件直链（mp4/flv/mkv）的分段并发连接数，默认 12。这些分段共用同一个连接池（上限 12×2=24 条连接、keep-alive 30 秒），不会每段都重做一次 TCP/TLS 握手。仅当服务端支持 Range 且文件大于下面的阈值时生效；不支持 Range 的站点会自动退回单连接。小站可降到 4-8，别开太大以免被限速或封 IP。"
   },
   "direct_parallel_min_mb": {
     "description": "【下载】直链启用多连接的最小体积（MB）",
     "type": "int",
     "default": 4,
     "hint": "小于该体积的直链不分段（小文件分段的握手开销反而更慢）。"
+  },
+  "http2": {
+    "description": "【下载】分片/直链下载启用 HTTP/2 多路复用",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，HLS 分片与直链分段走 HTTP/2，单个连接可并发多个请求，减少握手和队头阻塞，对「多小分片」提速明显；需要 h2 依赖，且仅对 HTTPS 媒体生效。个别老 CDN/代理不兼容 h2 时，程序会自动回退 HTTP/1.1；也可手动关闭强制走 1.1。"
   },
   "compress_fuse_hls": {
     "description": "【压缩】HLS 合并时顺带压缩",
