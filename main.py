@@ -94,7 +94,7 @@ _SELECT_RE = re.compile(r"^(?:选|选择|第)?[#＃]?(\d{1,2})(?:号|个|条)?$"
 _CANCEL_WORDS = {"取消", "算了", "放弃", "不要了", "不用了", "退出", "cancel", "q"}
 
 
-@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.0",
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.1",
           "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
