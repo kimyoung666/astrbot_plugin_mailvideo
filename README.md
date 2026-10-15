@@ -89,6 +89,16 @@
 | `reply_wait_timeout` | `120` | 等待回信超时（秒） |
 | `reply_poll_interval` | `5` | 轮询间隔（秒） |
 
+### 固定站点
+
+| 配置项 | 说明 |
+|---|---|
+| `site_1_enabled` / `site_1_address` | 第 1 个固定站点的开关与地址 |
+| `site_2_enabled` / `site_2_address` | 第 2 个固定站点的开关与地址 |
+| `site_3_enabled` / `site_3_address` | 第 3 个固定站点的开关与地址 |
+
+三个站点按 1→2→3 顺序取第一个「已启用且非空」的地址；启用后直连该站点，完全跳过邮件取址。全部不启用时才走「发信→等回信」流程。
+
 ### 地址提取
 
 | 配置项 | 默认 | 说明 |
@@ -100,7 +110,7 @@
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `search_url_template` | `{base}/search?wd={keyword}` | 站点搜索 URL 模板，支持 `{base}`（邮件地址）与 `{keyword}` 占位符 |
+| `search_url_template` | `{base}/search?wd={keyword}` | 站点搜索 URL 模板，支持 `{base}` 与 `{keyword}`（已 URL 编码）/ `{raw_keyword}`（不编码）。可用 `||` 或换行分隔多个模板，按顺序尝试，哪个先搜到结果就用哪个——例如 `{base}/search?query={keyword} \|\| {base}/search/{keyword}/` |
 | `cookie` | 空 | 目标站点 Cookie（部分站需要） |
 | `http_proxy` | 空 | 代理，如 `http://127.0.0.1:7890` / `socks5://127.0.0.1:1080` |
 | `ffmpeg_path` | 空 | 自定义 ffmpeg 路径 |

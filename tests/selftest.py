@@ -181,6 +181,27 @@ class TestVideoFetcher(unittest.TestCase):
             "https://s.cc/index.php/vod/search.html?wd=abc",
         )
 
+    def test_build_search_url_multi_template(self):
+        raw = "{base}/search?query={keyword} || {base}/search/{keyword}/"
+        f = VideoFetcher(search_url_template=raw)
+        # 拆出两个模板
+        self.assertEqual(len(f.search_templates), 2)
+        urls = f.build_search_urls("https://site.top/", "复仇者 联盟")
+        self.assertEqual(
+            urls[0],
+            "https://site.top/search?query=" + __import__("urllib.parse", fromlist=["quote"]).quote("复仇者 联盟"),
+        )
+        self.assertTrue(urls[1].startswith("https://site.top/search/"))
+        self.assertTrue(urls[1].endswith("/"))
+        # 单值接口仍返回第一个
+        self.assertEqual(f.build_search_url("https://site.top/", "abc"),
+                         "https://site.top/search?query=abc")
+
+    def test_build_search_url_newline_separated(self):
+        raw = "{base}/search?wd={keyword}\n{base}/search/{keyword}/"
+        f = VideoFetcher(search_url_template=raw)
+        self.assertEqual(len(f.search_templates), 2)
+
     def test_score_candidate(self):
         score_media = VideoFetcher._score_candidate("https://s.cc/v/1.mp4", "片子", "片子")
         score_nav = VideoFetcher._score_candidate("https://s.cc/about", "关于", "片子")

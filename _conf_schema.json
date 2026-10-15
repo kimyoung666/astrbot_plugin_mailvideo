@@ -66,11 +66,38 @@
     "default": "",
     "hint": "留空使用内置规则。填写后优先按此正则的捕获组提取。"
   },
-  "site_address": {
-    "description": "【地址】固定站点地址（可选）",
+  "site_1_enabled": {
+    "description": "【固定站点1】启用",
+    "type": "bool",
+    "default": false
+  },
+  "site_1_address": {
+    "description": "【固定站点1】地址",
     "type": "string",
     "default": "",
-    "hint": "填了就直接使用该地址，完全跳过「发信→等回信」环节（也不怕插件数据被清）。留空则走原来的「邮件取址 + 缓存回退」流程。例：https://example.cc/"
+    "hint": "例如 https://example.cc/。启用后直连该地址，跳过邮件取址。"
+  },
+  "site_2_enabled": {
+    "description": "【固定站点2】启用",
+    "type": "bool",
+    "default": false
+  },
+  "site_2_address": {
+    "description": "【固定站点2】地址",
+    "type": "string",
+    "default": "",
+    "hint": "上一个站点未启用时才会用到；填了地址但开关关闭则忽略。"
+  },
+  "site_3_enabled": {
+    "description": "【固定站点3】启用",
+    "type": "bool",
+    "default": false
+  },
+  "site_3_address": {
+    "description": "【固定站点3】地址",
+    "type": "string",
+    "default": "",
+    "hint": "三个固定站点按 1→2→3 顺序取第一个「已启用且非空」的地址。"
   },
   "use_cache_on_fail": {
     "description": "提取失败时回退上次成功地址",
@@ -81,7 +108,7 @@
     "description": "站点搜索 URL 模板",
     "type": "string",
     "default": "{base}/search?wd={keyword}",
-    "hint": "支持 {base}（邮件提取到的站点地址）与 {keyword}（用户关键词）占位符。"
+    "hint": "支持 {base}（站点地址）与 {keyword}（关键词，URL 已编码）/ {raw_keyword}（不编码）占位符。可用 || 或换行分隔多个模板，按顺序尝试，哪个先搜到结果就用哪个；例如同时兼容两种写法：{base}/search?query={keyword} || {base}/search/{keyword}/"
   },
   "select_candidates": {
     "description": "【回传】候选清单最多列出几条",

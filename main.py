@@ -94,8 +94,8 @@ _SELECT_RE = re.compile(r"^(?:选|选择|第)?[#＃]?(\d{1,2})(?:号|个|条)?$"
 _CANCEL_WORDS = {"取消", "算了", "放弃", "不要了", "不用了", "退出", "cancel", "q"}
 
 
-@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.3.0",
-          "https://github.com/your-name/astrbot_plugin_mailvideo")
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.0",
+          "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -236,8 +236,11 @@ class MailVideoPlugin(Star):
 
         # ── 子指令：/搜片 帮助 ──
         if kw in ("帮助", "help", "用法"):
-            fixed = str(self._cfg("site_address", "") or "").strip()
-            cached = fixed or self.store.get_last_address() or "（暂无）"
+            fixed = self._enabled_fixed_sites()
+            cached = (fixed[0] if fixed else "") or self.store.get_last_address() or "（暂无）"
+            extra = ""
+            if len(fixed) > 1:
+                extra = f"（共 {len(fixed)} 个固定站点已启用）"
             yield event.plain_result(
                 "邮箱取址视频搜索 · 用法\n"
                 "/搜片 <关键词>   搜索并回传视频\n"
@@ -245,7 +248,7 @@ class MailVideoPlugin(Star):
                 "/搜片 邮箱        测试邮箱连接\n"
                 "/搜片 取消        取消待选的候选\n"
                 "/搜片 帮助        显示本帮助\n"
-                f"\n当前缓存站点地址：{cached}\n"
+                f"\n当前站点地址：{cached}{extra}\n"
                 "首次使用请先在插件配置中填写邮箱账号、授权码与收件邮箱。"
             )
             return
@@ -395,9 +398,20 @@ class MailVideoPlugin(Star):
         ok = await self._send_video(umo, path)
         send_seconds = time.time() - _send_started
         if ok:
-            logger.info(f"[mailvideo] 已回传视频{suffix}: {path.name}")
+            # 发送成功：立即删除本地文件，不依赖 finally 兜底，避免长时间占用磁盘
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(f"[mailvideo] 删除已发送文件失败: {e}")
+            logger.info(
+                f"[mailvideo] ✅ 发送成功{suffix} | {path.name} | {size_mb:.2f}MB | "
+                f"已送达用户，本地文件已删除"
+            )
         else:
-            logger.info(f"[mailvideo] 视频已转为待投递{suffix}: {path.name}")
+            logger.warning(
+                f"[mailvideo] ⚠️ 发送失败{suffix} | {path.name} | {size_mb:.2f}MB | "
+                f"已暂存为待投递，等用户下次发消息时补发"
+            )
         logger.info(
             f"[mailvideo] ⏱️ 本次耗时明细 | 下载 {dl_seconds:.1f}s"
             + (f" | 压缩 {cp_seconds:.1f}s" if cp_seconds else "")
@@ -551,20 +565,31 @@ class MailVideoPlugin(Star):
             finally:
                 self._cleanup(tmp_dir)
 
-    async def _fetch_address(self, umo: str) -> tuple[Optional[str], str]:
-        """执行「发信 → 等回信 → 提取地址」，返回 (地址, 回信正文)。
+    def _enabled_fixed_sites(self) -> list[str]:
+        """返回所有已启用且非空的固定站点地址，按 1→2→3 顺序。"""
+        out: list[str] = []
+        for i in (1, 2, 3):
+            if not bool(self._cfg(f"site_{i}_enabled", False)):
+                continue
+            url = str(self._cfg(f"site_{i}_address", "") or "").strip()
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            out.append(url.rstrip("/") + "/")
+        return out
 
-        若配置了 ``site_address``（固定站点地址），则直接使用该地址，
-        完全跳过邮件流程（不发信、不等回信），也不依赖缓存。
-        """
-        # ── 固定站点地址优先：填了就直连使用 ──
-        fixed = str(self._cfg("site_address", "") or "").strip()
-        if fixed:
-            if not fixed.startswith(("http://", "https://")):
-                fixed = "https://" + fixed
-            self.store.set_last_address(fixed)  # 同步进缓存，兜底其它逻辑
-            logger.info(f"[mailvideo] 使用固定站点地址: {fixed}")
-            return fixed, ""
+    async def _fetch_address(self, umo: str) -> tuple[Optional[str], str]:
+        """取站点地址：优先用已启用的固定站点；否则走「发信→等回信→提取」。"""
+        # ── 固定站点：按顺序取第一个启用的 ──
+        fixed_sites = self._enabled_fixed_sites()
+        if fixed_sites:
+            address = fixed_sites[0]
+            self.store.set_last_address(address)
+            logger.info(
+                f"[mailvideo] 使用固定站点({len(fixed_sites)}个已启用): {address}"
+            )
+            return address, ""
 
         client = self._build_mail_client()
         client.validate()
@@ -755,8 +780,11 @@ class MailVideoPlugin(Star):
                 else:
                     chain = MessageChain([Comp.Video.fromFileSystem(path=str(path))])
                 await self.context.send_message(umo, chain)
+                size_mb = path.stat().st_size / 1024 / 1024 if path.exists() else 0
                 path.unlink(missing_ok=True)
-                logger.info(f"[mailvideo] 待投递视频补发成功: {path.name}")
+                logger.info(
+                    f"[mailvideo] ✅ 待投递视频补发成功 | {path.name} | {size_mb:.2f}MB | 本地文件已删除"
+                )
             elif item.get("type") == "text":
                 await self._send_text(umo, "\u200b📬 补发之前的结果：\n" + str(item.get('text', '')))
             else:

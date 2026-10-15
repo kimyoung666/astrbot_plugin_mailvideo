@@ -76,7 +76,14 @@ class VideoFetcher:
         direct_parallel_workers: int = 8,
         direct_parallel_min_mb: int = 4,
     ) -> None:
-        self.search_url_template = search_url_template or "{base}/search?wd={keyword}"
+        raw = (search_url_template or "{base}/search?wd={keyword}").strip()
+        # 支持用 "||" 或换行分隔多个候选模板：按顺序尝试，第一个返回真实结果的模板生效。
+        # 这样可以同时兼容 ``{base}/search?query={keyword}`` 与 ``{base}/search/{keyword}/`` 这类不同站点写法。
+        self.search_templates: list[str] = [
+            t.strip() for t in re.split(r"\s*(?:\|\||\n)\s*", raw) if t.strip()
+        ] or ["{base}/search?wd={keyword}"]
+        # 保留单模板字段，向后兼容旧测试/外部引用
+        self.search_url_template = self.search_templates[0]
         self.max_results = max(1, int(max_results))
         self.cookie = cookie or ""
         self.proxy = proxy or ""
@@ -121,41 +128,62 @@ class VideoFetcher:
             headers["Cookie"] = self.cookie
         return headers
 
-    def build_search_url(self, base: str, keyword: str) -> str:
+    def _fill_template(self, template: str, base: str, keyword: str) -> str:
         base = (base or "").rstrip("/")
         return (
-            self.search_url_template.replace("{base}", base)
+            template.replace("{base}", base)
             .replace("{keyword}", quote(keyword))
             .replace("{raw_keyword}", keyword)
         )
+
+    def build_search_url(self, base: str, keyword: str) -> str:
+        """拼第一个模板对应的搜索 URL（向后兼容）。"""
+        return self._fill_template(self.search_templates[0], base, keyword)
+
+    def build_search_urls(self, base: str, keyword: str) -> list[str]:
+        """按配置顺序拼出全部候选搜索 URL。"""
+        return [self._fill_template(t, base, keyword) for t in self.search_templates]
 
     # ============================================================== #
     # 搜索
     # ============================================================== #
     def search(self, base: str, keyword: str) -> list[dict]:
-        """返回候选视频条目列表：``[{"url": ..., "title": ...}, ...]``。"""
-        search_url = self.build_search_url(base, keyword)
-        logger.info(f"[mailvideo] 搜索地址: {search_url}")
+        """返回候选视频条目列表：``[{"url": ..., "title": ...}, ...]``。
 
-        candidates: list[dict] = []
-        # 1) 尝试让 yt-dlp 直接枚举搜索页
-        try:
-            candidates = self._search_via_ytdlp(search_url, keyword)
-        except Exception as e:
-            logger.warning(f"[mailvideo] yt-dlp 枚举搜索页失败: {e}")
+        若配置了多个模板（用 ``||`` 或换行分隔），按顺序逐个尝试：
+        某个 URL 通过 yt-dlp / HTML 解析拿到真实候选就直接返回；全部失败再兜底。
+        """
+        search_urls = self.build_search_urls(base, keyword)
+        for i, search_url in enumerate(search_urls, 1):
+            if len(search_urls) > 1:
+                logger.info(f"[mailvideo] 搜索地址({i}/{len(search_urls)}): {search_url}")
+            else:
+                logger.info(f"[mailvideo] 搜索地址: {search_url}")
 
-        # 2) 回退：抓 HTML 解析候选链接
-        if not candidates:
+            candidates: list[dict] = []
+            # 1) 尝试让 yt-dlp 直接枚举搜索页
             try:
-                candidates = self._search_via_html(search_url, base, keyword)
+                candidates = self._search_via_ytdlp(search_url, keyword)
             except Exception as e:
-                logger.warning(f"[mailvideo] HTML 解析搜索页失败: {e}")
+                logger.warning(f"[mailvideo] yt-dlp 枚举搜索页失败: {e}")
 
-        # 3) 兜底：把搜索页本身当作可解析页面
-        if not candidates:
-            candidates = [{"url": search_url, "title": keyword}]
+            # 2) 回退：抓 HTML 解析候选链接
+            if not candidates:
+                try:
+                    candidates = self._search_via_html(search_url, base, keyword)
+                except Exception as e:
+                    logger.warning(f"[mailvideo] HTML 解析搜索页失败: {e}")
 
-        return candidates
+            # 拿到真实候选就返回，不再尝试后面的模板
+            if candidates:
+                return candidates
+
+        # 3) 所有模板都没拿到候选：兜底，把最后一个搜索页当作可解析页面
+        last_url = search_urls[-1]
+        logger.warning(
+            f"[mailvideo] 全部 {len(search_urls)} 个搜索模板均未命中候选，兜底尝试: {last_url}"
+        )
+        return [{"url": last_url, "title": keyword}]
 
     def _search_via_ytdlp(self, search_url: str, keyword: str) -> list[dict]:
         ydl_opts = self._base_ydl_opts()
