@@ -181,50 +181,8 @@
   "max_video_size_mb": {
     "description": "单个视频大小上限（MB）",
     "type": "int",
-    "default": 100,
-    "hint": "超过该值不再直接发文件，改为返回直链文本，避免平台发送失败。建议配合「画质压缩」使用：压缩后再判断，更容易直接发出去。"
-  },
-  "compress_enable": {
-    "description": "【压缩】启用画质压缩",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，下载完成的视频会先转码压缩再发送（体积明显变小，但会多花一点转换时间）。注意：压缩发生在下载之后，不会减少下载耗时。"
-  },
-  "compress_preset": {
-    "description": "【压缩】编码预设（速度/压缩率权衡）",
-    "type": "string",
-    "default": "veryfast",
-    "hint": "libx264 预设。越快越省时间、压缩率越低。可选：ultrafast / superfast / veryfast / faster / fast / medium / slow。推荐 veryfast；机器强可试 medium。"
-  },
-  "compress_target_height": {
-    "description": "【压缩】目标分辨率高度（0=保持原画质只降码率）",
-    "type": "int",
-    "default": 720,
-    "hint": "例：填 720 则 1080p 视频会缩到 720p。填 480 更省流量但更糊。填 0 表示不缩放分辨率，只靠 CRF 降码率。"
-  },
-  "compress_crf": {
-    "description": "【压缩】质量因子 CRF（越大越糊越小）",
-    "type": "int",
-    "default": 30,
-    "hint": "x264 常用范围 18~32。23 接近原画质，28 尚可，30 明显变小，32+ 画质下降明显。仅在未填「目标码率」时生效。"
-  },
-  "compress_target_bitrate": {
-    "description": "【压缩】目标视频码率（可选，如 800k）",
-    "type": "string",
-    "default": "",
-    "hint": "填了就按固定码率压缩（体积可预估），留空则用 CRF 智能压缩、画质更均匀。例：600k / 1M。"
-  },
-  "compress_audio_bitrate": {
-    "description": "【压缩】音频码率",
-    "type": "string",
-    "default": "64k",
-    "hint": "音频统一转 AAC。64k 够用，96k/128k 音质更好也更占体积。"
-  },
-  "compress_threshold_mb": {
-    "description": "【压缩】仅当文件大于该值才压缩（MB，0=总是压缩）",
-    "type": "int",
-    "default": 0,
-    "hint": "填 50 表示小于 50MB 的小视频直接原样发送、不浪费转换时间；只有大文件才压缩。填 0 则所有视频都压。"
+    "default": 1024,
+    "hint": "超过该值不再直接发文件，改为返回直链文本，避免平台发送失败。默认 1024MB（1GB）。"
   },
   "allowed_users": {
     "description": "允许使用的用户 ID 列表（留空 = 所有人）",
@@ -254,11 +212,5 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，HLS 分片与直链分段走 HTTP/2，单个连接可并发多个请求，减少握手和队头阻塞，对「多小分片」提速明显；需要 h2 依赖，且仅对 HTTPS 媒体生效。个别老 CDN/代理不兼容 h2 时，程序会自动回退 HTTP/1.1；也可手动关闭强制走 1.1。"
-  },
-  "compress_fuse_hls": {
-    "description": "【压缩】HLS 合并时顺带压缩",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，m3u8 下载完成时把「合并」和「压缩」合成一次 ffmpeg 调用，不再落一份完整体积的中转 mp4，省一次全量读写、也省一份磁盘占用。仅在「压缩阈值」为 0（总是压缩）时生效；编码失败会自动退回普通合并，不影响下载。"
   }
 }

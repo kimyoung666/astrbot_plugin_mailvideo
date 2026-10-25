@@ -94,7 +94,7 @@ _SELECT_RE = re.compile(r"^(?:选|选择|第)?[#＃]?(\d{1,2})(?:号|个|条)?$"
 _CANCEL_WORDS = {"取消", "算了", "放弃", "不要了", "不用了", "退出", "cancel", "q"}
 
 
-@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.2",
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.3",
           "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -105,6 +105,9 @@ class MailVideoPlugin(Star):
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
         self._gc_pending_files(self.data_dir / "pending")
+        # 启动时清掉上次异常退出（被 kill / 崩溃）留下的下载缓存目录，
+        # 正常情况下发送完成就已即时删除，这里只兜底。
+        self._purge_stale_cache()
 
     # ================================================================== #
     # 配置读取
@@ -182,32 +185,6 @@ class MailVideoPlugin(Star):
             return (urlparse(url).hostname or url or "").lower()
         except Exception:
             return url or ""
-
-    def _fused_encode_opts(self, fetcher) -> Optional[dict]:
-        """决定是否把「压缩」提前到下载的合并阶段一趟完成。
-
-        返回压缩参数字典交给 ``VideoFetcher.download``（HLS 走「合并+压缩」
-        一次 ffmpeg 调用，不再落一份完整体积的中转 mp4）；返回 ``None``
-        则沿用原来的「下完整文件 → 再单独压缩」流程。
-
-        仅在**压缩阈值 = 0（总是压缩）**时启用：阈值 > 0 时需要先知道文件
-        实际多大才能决定压不压，而下载阶段无从预判。
-        """
-        if not bool(self._cfg("compress_enable", False)):
-            return None
-        if not bool(self._cfg("compress_fuse_hls", True)):
-            return None
-        if int(self._cfg("compress_threshold_mb", 0) or 0) > 0:
-            return None
-        if not fetcher.ffmpeg_available():
-            return None
-        return {
-            "target_height": int(self._cfg("compress_target_height", 720) or 0),
-            "crf": int(self._cfg("compress_crf", 30) or 30),
-            "preset": str(self._cfg("compress_preset", "veryfast") or "veryfast").strip(),
-            "target_bitrate": str(self._cfg("compress_target_bitrate", "") or "").strip(),
-            "audio_bitrate": str(self._cfg("compress_audio_bitrate", "64k") or "64k").strip(),
-        }
 
     def _allowed(self, event: AstrMessageEvent) -> bool:
         allow = self._cfg("allowed_users", []) or []
@@ -392,9 +369,6 @@ class MailVideoPlugin(Star):
     ) -> tuple[bool, str]:
         """下载单个候选并回传，返回 (是否已处理, 错误信息)。"""
         url = cand.get("url") or ""
-        # 压缩开启且阈值为 0 时，让 HLS 下载在合并阶段顺带完成压缩，
-        # 省掉一份完整体积的中转文件和一次全量读写。
-        encode_opts = self._fused_encode_opts(fetcher)
         _dl_started = time.time()
         try:
             result = await asyncio.to_thread(
@@ -403,7 +377,6 @@ class MailVideoPlugin(Star):
                 tmp_dir,
                 max_size_mb,
                 cand.get("title") or "",
-                encode_opts,
             )
         except Exception as e:
             logger.warning(
@@ -419,16 +392,6 @@ class MailVideoPlugin(Star):
             f"耗时 {dl_seconds:.1f}s"
         )
 
-        # ---- ⓸b 画质压缩（可选）----
-        # HLS 路径若已在合并阶段顺带编码，这里直接跳过，避免压两遍。
-        cp_seconds = 0.0
-        if result.get("pre_encoded"):
-            logger.info("[mailvideo] —— 已在下载合并阶段顺带压缩，跳过独立压缩")
-        else:
-            _cp_started = time.time()
-            path, size_mb = await self._maybe_compress(umo, fetcher, path, size_mb, tmp_dir)
-            cp_seconds = time.time() - _cp_started
-
         if size_mb > max_size_mb:
             await self._send_text(
                 umo,
@@ -436,6 +399,8 @@ class MailVideoPlugin(Star):
                 f"改为返回链接：\n{result.get('webpage_url') or url}",
                 critical=True,
             )
+            # 不发这个文件，本地副本也没有保留价值，直接删掉
+            self._cleanup(tmp_dir)
             return True, ""
 
         suffix = f"（{tag}）" if tag else ""
@@ -443,14 +408,12 @@ class MailVideoPlugin(Star):
         ok = await self._send_video(umo, path)
         send_seconds = time.time() - _send_started
         if ok:
-            # 发送成功：立即删除本地文件，不依赖 finally 兜底，避免长时间占用磁盘
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as e:
-                logger.warning(f"[mailvideo] 删除已发送文件失败: {e}")
+            # 发送完成：立即删除本地视频与本次任务的缓存目录，
+            # 不依赖 finally 兜底，避免大文件长时间占用磁盘。
+            self._cleanup(tmp_dir)
             logger.info(
                 f"[mailvideo] ✅ 发送成功{suffix} | {path.name} | {size_mb:.2f}MB | "
-                f"已送达用户，本地文件已删除"
+                f"已送达用户，本地视频与缓存已删除"
             )
         else:
             logger.warning(
@@ -459,9 +422,8 @@ class MailVideoPlugin(Star):
             )
         logger.info(
             f"[mailvideo] ⏱️ 本次耗时明细 | 下载 {dl_seconds:.1f}s"
-            + (f" | 压缩 {cp_seconds:.1f}s" if cp_seconds else "")
             + f" | 发送 {send_seconds:.1f}s"
-            + f" | 合计 {dl_seconds + cp_seconds + send_seconds:.1f}s"
+            + f" | 合计 {dl_seconds + send_seconds:.1f}s"
             + f" | 最终体积 {size_mb:.2f}MB"
         )
         return True, ""
@@ -584,7 +546,7 @@ class MailVideoPlugin(Star):
                     await self._send_text(
                         umo, "⚠️ 未检测到 ffmpeg，m3u8 合并/高清合流可能失败，将尽量尝试。"
                     )
-                max_size_mb = max(1, int(self._cfg("max_video_size_mb", 100) or 100))
+                max_size_mb = max(1, int(self._cfg("max_video_size_mb", 1024) or 1024))
                 label = self._cand_title(cand, index + 1)
                 logger.info(
                     f"[mailvideo] —— 选择模式下载第 {index + 1} 个 —— "
@@ -851,78 +813,50 @@ class MailVideoPlugin(Star):
         except Exception as e:
             logger.error(f"[mailvideo] 待投递处理异常: {e}")
 
-    async def _maybe_compress(
-        self, umo: str, fetcher, path: Path, size_mb: float, tmp_dir: Path
-    ) -> tuple[Path, float]:
-        """按配置对下载好的视频做画质压缩，返回 (可能被替换的路径, 新大小MB)。
-
-        压缩失败不影响主流程——沿用原文件继续走后续逻辑。
-        """
-        if not bool(self._cfg("compress_enable", False)):
-            return path, size_mb
-
-        threshold = int(self._cfg("compress_threshold_mb", 0) or 0)
-        if threshold > 0 and size_mb <= threshold:
-            logger.info(
-                f"[mailvideo] {size_mb:.1f}MB 未超过压缩阈值 {threshold}MB，跳过压缩"
-            )
-            return path, size_mb
-
-        target_h = int(self._cfg("compress_target_height", 720) or 0)
-        crf = int(self._cfg("compress_crf", 30) or 30)
-        preset = str(self._cfg("compress_preset", "veryfast") or "veryfast").strip()
-        v_br = str(self._cfg("compress_target_bitrate", "") or "").strip()
-        a_br = str(self._cfg("compress_audio_bitrate", "64k") or "64k").strip()
-
-        await self._send_text(
-            umo,
-            f"🗜️ 正在压缩画质（原始 {size_mb:.1f}MB"
-            + (f" → {target_h}p" if target_h else "")
-            + "）…",
-        )
-        _c_started = time.time()
-        try:
-            res = await asyncio.to_thread(
-                fetcher.compress_video,
-                path, tmp_dir, target_h, crf, preset, v_br, a_br,
-            )
-        except Exception as e:
-            logger.warning(f"[mailvideo] —— 压缩失败，改用原文件: {e}")
-            await self._send_text(umo, f"⚠️ 压缩失败，改用原文件：{e}")
-            return path, size_mb
-
-        new_path = Path(res["path"])
-        if not new_path.exists() or new_path.stat().st_size == 0:
-            logger.warning("[mailvideo] 压缩产物无效，改用原文件")
-            return path, size_mb
-
-        new_mb = new_path.stat().st_size / 1024 / 1024
-        saved = (1 - new_mb / size_mb) * 100 if size_mb else 0
-        logger.info(
-            f"[mailvideo] —— 压缩成功 —— {size_mb:.2f}MB → {new_mb:.2f}MB"
-            f"（省 {saved:.0f}%）| 耗时 {time.time() - _c_started:.1f}s"
-        )
-        return new_path, new_mb
-
     def _cleanup(self, tmp_dir: Path):
-        """清理本次任务的临时文件（等待发送完成后调用）。"""
+        """清理本次任务的本地缓存目录（发送完成后立即调用）。"""
+        tmp_dir = Path(tmp_dir)
         try:
-            if Path(tmp_dir).exists():
-                for p in Path(tmp_dir).rglob("*"):
-                    if p.is_file():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
+            if not tmp_dir.exists():
+                return
+            # 先删文件再自底向上删目录，避免残留分片目录
+            for p in sorted(tmp_dir.rglob("*"), key=lambda x: len(x.parts), reverse=True):
                 try:
-                    for d in sorted(Path(tmp_dir).rglob("*"), reverse=True):
-                        if d.is_dir():
-                            d.rmdir()
-                    Path(tmp_dir).rmdir()
+                    if p.is_file():
+                        p.unlink(missing_ok=True)
+                    elif p.is_dir():
+                        p.rmdir()
                 except OSError:
                     pass
+            try:
+                tmp_dir.rmdir()
+            except OSError:
+                pass
         except Exception as e:  # pragma: no cover
             logger.debug(f"[mailvideo] 清理临时文件失败: {e}")
+
+    def _purge_stale_cache(self) -> None:
+        """启动时清空下载缓存目录（temp 下的 job_* 与残留分片）。"""
+        try:
+            temp_root = Path(self.store.temp_dir)
+            if not temp_root.exists():
+                return
+            removed = 0
+            for d in temp_root.iterdir():
+                try:
+                    if d.is_dir():
+                        self._cleanup(d)
+                        removed += 1
+                    elif d.is_file():
+                        d.unlink(missing_ok=True)
+                        removed += 1
+                except OSError:
+                    pass
+            if removed:
+                logger.info(f"[mailvideo] 启动清理上次残留缓存 {removed} 项")
+        except Exception as e:  # pragma: no cover
+            logger.debug(f"[mailvideo] 启动清理缓存失败: {e}")
+
 
     # ================================================================== #
     @staticmethod

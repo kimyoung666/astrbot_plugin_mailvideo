@@ -4,7 +4,6 @@
   A. 直链 + 服务端支持 Range  → 走多连接分段，文件必须与源文件字节一致
   B. 直链 + 服务端不支持 Range → 自动退回单连接，文件仍必须一致
   C. HLS 并行下载（纯合并）   → 产物可解码、时长正常
-  D. HLS 并行下载 + 合并即压缩 → pre_encoded=True、体积明显变小、可解码
 """
 
 from __future__ import annotations
@@ -270,46 +269,15 @@ def main():
     p3 = Path(res3["path"])
     check("C1 产物存在且非空", p3.exists() and p3.stat().st_size > 0,
           f"{p3.stat().st_size/1024/1024:.2f}MB")
-    check("C2 pre_encoded=False", res3.get("pre_encoded") is False)
     check("C3 时长正常(~20s)", abs(probe_duration(p3) - 20) < 1.5,
           f"{probe_duration(p3):.2f}s")
-    check("C4 分片目录已清理",
-          not any(out_c.glob("_segs_*")), "临时分片已删")
 
-    # ---------------- D. HLS 合并即压缩 ----------------
-    print("\nD. HLS 合并+压缩一次完成")
-    out_d = WORK / "out_d"
-    out_d.mkdir(exist_ok=True)
-    f4 = VideoFetcher(hls_parallel_workers=4, timeout=10)
-    res4 = f4._download_hls_parallel(
-        f"{rng_base}/index.m3u8", out_d, title="d",
-        encode_opts={"target_height": 360, "crf": 32, "preset": "ultrafast",
-                     "target_bitrate": "", "audio_bitrate": "64k"},
-    )
-    p4 = Path(res4["path"])
-    check("D1 pre_encoded=True", res4.get("pre_encoded") is True)
-    check("D2 产物可解码且时长正常", abs(probe_duration(p4) - 20) < 1.5,
-          f"{probe_duration(p4):.2f}s")
-    check("D3 画面已按目标高度缩放",
-          _height(p4) == 360, f"实际高度 {_height(p4)}")
-    check("D4 没有留下中转 mp4（只应有压缩产物）",
-          len(list(out_d.glob("*.mp4"))) == 1,
-          f"目录内 mp4 数 = {len(list(out_d.glob('*.mp4')))}")
-
-    # ---------------- E. 编码失败要能回退 ----------------
-    print("\nE. 压缩参数非法时回退纯合并")
-    out_e = WORK / "out_e"
-    out_e.mkdir(exist_ok=True)
-    f5 = VideoFetcher(hls_parallel_workers=4, timeout=10)
-    res5 = f5._download_hls_parallel(
-        f"{rng_base}/index.m3u8", out_e, title="e",
-        encode_opts={"target_height": 360, "crf": "这不是数字",
-                     "preset": "totally-bogus-preset", "target_bitrate": ""},
-    )
-    p5 = Path(res5["path"])
-    check("E1 回退后仍拿到可用文件",
-          p5.exists() and probe_duration(p5) > 15, f"{p5.stat().st_size/1024/1024:.2f}MB")
-    check("E2 pre_encoded 标记为 False（回退了）", res5.get("pre_encoded") is False)
+    # ---------------- D. 分片目录与临时文件清理 ----------------
+    print("\nD. 下载产物不留临时文件")
+    check("D1 分片目录已清理", not any(out_c.glob("_segs_*")))
+    check("D2 无加密密钥残留", not any(out_c.glob("_key_*")))
+    check("D3 只留一个成品文件", len(list(out_c.glob("*.mp4"))) == 1,
+          f"目录内 mp4 数 = {len(list(out_c.glob('*.mp4')))}")
 
     rng_srv.shutdown()
     nor_srv.shutdown()

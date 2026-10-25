@@ -455,17 +455,11 @@ class VideoFetcher:
         dest_dir: Path,
         max_size_mb: int = 0,
         title: str = "",
-        encode_opts: Optional[dict] = None,
     ) -> dict:
         """下载单个视频，返回 ``{"path": str, "title": str, "webpage_url": str}``。
 
         ``max_size_mb`` > 0 时启用**预检**：先读取 m3u8 播放列表估算体积，
         超限则直接抛错，避免把几百 MB 甚至 1GB 的内容白下完再丢弃。
-
-        ``encode_opts`` 传入压缩参数（target_height/crf/preset/target_bitrate/
-        audio_bitrate）时，HLS 路径会把「合并」与「压缩」合成一次 ffmpeg 调用，
-        不再落一份完整体积的中转 mp4。成功时返回值带 ``pre_encoded=True``，
-        调用方据此跳过后续独立的压缩步骤。
         """
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -519,7 +513,6 @@ class VideoFetcher:
                 try:
                     return self._download_hls_parallel(
                         media_url, dest_dir, referer=url, title=page_title,
-                        encode_opts=encode_opts,
                     )
                 except Exception as e:
                     last_err = e
@@ -583,14 +576,11 @@ class VideoFetcher:
         dest_dir: Path,
         referer: str = "",
         title: str = "",
-        encode_opts: Optional[dict] = None,
     ) -> dict:
         """并行下载 HLS 分片 + ffmpeg 合并。
 
         支持 AES-128 加密：下载密钥后生成本地 m3u8，
         ffmpeg 自动解密 + 合并。实测 16 线程对比单流提速 ~8-10x。
-
-        传入 ``encode_opts`` 时，合并阶段直接出压缩产物，不再落中转文件。
         """
         import concurrent.futures
         import urllib.parse as _urlparse
@@ -818,23 +808,8 @@ class VideoFetcher:
             f.write("#EXT-X-ENDLIST\n")  # 必须！否则 ffmpeg 当直播流无限等下一片
 
         # ── 7) ffmpeg 合并（自动解密）──
-        # encode_opts 存在时：合并与压缩合成一次调用，不再落一份完整体积的中转 mp4。
-        # 编码失败会自动回退到原来的 -c copy 纯合并，不会让整个下载任务白费。
-        pre_encoded = False
         try:
-            if encode_opts:
-                try:
-                    logger.info("[mailvideo] 合并 + 压缩一次完成（省掉中转文件）")
-                    self._mux_local_playlist(local_m3u8, out, encode_opts=encode_opts)
-                    pre_encoded = True
-                except Exception as e:
-                    logger.warning(f"[mailvideo] 合并+压缩失败，回退纯合并: {e}")
-                    try:
-                        out.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            if not pre_encoded:
-                self._mux_local_playlist(local_m3u8, out)
+            self._mux_local_playlist(local_m3u8, out)
         except Exception:
             shutil.rmtree(seg_dir, ignore_errors=True)
             if key_file:
@@ -854,74 +829,29 @@ class VideoFetcher:
             f"[mailvideo] ✅ 并行下载完成 {out.name} | "
             f"{size_bytes/1024/1024:.2f}MB | "
             f"总耗时 {time.time()-start:.1f}s"
-            + ("（合并时已顺带压缩）" if pre_encoded else "")
         )
         return {
             "path": str(out),
             "title": out.stem,
             "webpage_url": final_url,
             "filesize": size_bytes,
-            "pre_encoded": pre_encoded,
             "downloaded_bytes": total[0],
         }
 
-    def _mux_local_playlist(
-        self, local_m3u8: Path, out: Path, encode_opts: Optional[dict] = None
-    ) -> None:
-        """把本地 m3u8（含密钥指令）合并为 mp4。
-
-        - 不带 ``encode_opts``：``-c copy`` 纯封装，最快；
-        - 带 ``encode_opts``：同一趟里完成转码压缩，省掉一次全量中转读写。
-
-        ``encode_opts`` 支持 target_height / crf / preset / target_bitrate /
-        audio_bitrate，与 ``compress_video`` 的配置项同名同义。
-        """
-        base = [
+    def _mux_local_playlist(self, local_m3u8: Path, out: Path) -> None:
+        """把本地 m3u8（含密钥指令）合并为 mp4，``-c copy`` 纯封装，最快。"""
+        cmd = [
             self._ffmpeg_bin(), "-y", "-nostdin", "-v", "warning",
             "-allowed_extensions", "ALL",
             "-i", str(local_m3u8),
+            "-c", "copy", "-bsf:a", "aac_adtstoasc",
+            str(out),
         ]
-
-        if encode_opts:
-            target_h = int(encode_opts.get("target_height") or 0)
-            vf: list[str] = []
-            if target_h > 0:
-                # 用表达式等比缩放且不放大，省掉一次 ffprobe 探测
-                vf.append(f"scale=-2:'min(ih,{target_h})'")
-            vf.extend(["format=yuv420p", "setsar=1"])
-
-            cmd = base + [
-                "-vf", ",".join(vf),
-                "-c:v", "libx264",
-                "-preset", str(encode_opts.get("preset") or "veryfast"),
-            ]
-            bitrate = str(encode_opts.get("target_bitrate") or "").strip()
-            if bitrate:
-                cmd += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", "2M"]
-            else:
-                try:
-                    crf = int(encode_opts.get("crf") or 30)
-                except (TypeError, ValueError):
-                    crf = 30
-                cmd += ["-crf", str(crf)]
-            cmd += [
-                "-c:a", "aac",
-                "-b:a", str(encode_opts.get("audio_bitrate") or "64k"),
-                "-ac", "2",
-                "-progress", "pipe:1", "-nostats",
-                str(out),
-            ]
-            timeout = self.download_timeout
-        else:
-            cmd = base + [
-                "-c", "copy", "-bsf:a", "aac_adtstoasc",
-                str(out),
-            ]
-            timeout = 120
+        timeout = 120
 
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE if encode_opts else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True,
@@ -932,31 +862,7 @@ class VideoFetcher:
             target=self._drain_stderr, args=(proc, err_lines), daemon=True
         ).start()
 
-        start = time.time()
-        last_log = 0.0
-        out_time_s = 0.0
-        speed_x = 0.0
         try:
-            if proc.stdout is not None:
-                for raw in proc.stdout:
-                    line = raw.strip()
-                    if line.startswith("out_time_ms="):
-                        try:
-                            out_time_s = int(line.split("=", 1)[1]) / 1_000_000
-                        except ValueError:
-                            continue
-                        now = time.time()
-                        if now - last_log >= self.progress_interval:
-                            last_log = now
-                            self._log_compress_progress(
-                                out, out_time_s, 0.0, start, speed_x,
-                                "⏳ 合并+压缩中",
-                            )
-                    elif line.startswith("speed="):
-                        try:
-                            speed_x = float(line.split("=", 1)[1].replace("x", ""))
-                        except ValueError:
-                            pass
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -967,6 +873,9 @@ class VideoFetcher:
 
         if proc.returncode != 0:
             tail = [l.strip() for l in err_lines if l.strip()][-3:]
+            raise VideoFetchError("ffmpeg 合并失败: " + " | ".join(tail))
+
+
             raise VideoFetchError("ffmpeg 合并失败: " + " | ".join(tail))
 
 
@@ -1134,7 +1043,7 @@ class VideoFetcher:
         return shutil.which("ffprobe") or "ffprobe"
 
     def probe_video(self, path: Path) -> dict:
-        """用 ffprobe 读出视频的宽高、时长、码率，供压缩决策使用。"""
+        """用 ffprobe 读出视频的宽高、时长、码率。"""
         info = {"width": 0, "height": 0, "duration": 0.0, "bitrate": 0}
         try:
             proc = subprocess.run(
@@ -1157,152 +1066,6 @@ class VideoFetcher:
         except Exception as e:
             logger.debug(f"[mailvideo] ffprobe 探测失败（忽略）: {e}")
         return info
-
-    @staticmethod
-    def _even(n: int) -> int:
-        """libx264 要求宽高为偶数。"""
-        n = int(n)
-        return n if n % 2 == 0 else n - 1
-
-    def _target_scale(self, src_w: int, src_h: int, target_height: int) -> tuple[int, int]:
-        """按目标高度等比缩放（不放大小于源分辨率的视频）。"""
-        if target_height <= 0 or src_h <= 0 or src_w <= 0:
-            return 0, 0
-        scale = min(1.0, target_height / src_h)
-        return self._even(src_w * scale), self._even(src_h * scale)
-
-    def compress_video(
-        self,
-        src: Path,
-        dest_dir: Path,
-        target_height: int = 0,
-        crf: int = 30,
-        preset: str = "veryfast",
-        target_bitrate: str = "",
-        audio_bitrate: str = "64k",
-    ) -> dict:
-        """把视频转码压缩，返回新文件信息。
-
-        - ``target_height``: 目标高度（0=保持原分辨率，仅降码率）
-        - ``crf``: 质量因子，越大越糊越小（x264 常用 18~32）
-        - ``target_bitrate``: 显式指定视频码率（如 ``800k``），留空则用 CRF 模式
-        - ``preset``: 编码预设，越快越省时间、压缩率越低
-        """
-        if not self.ffmpeg_available():
-            raise VideoFetchError("未检测到 ffmpeg，无法压缩画质")
-
-        src = Path(src)
-        if not src.exists():
-            raise VideoFetchError(f"待压缩文件不存在: {src}")
-
-        src_size = src.stat().st_size
-        probe = self.probe_video(src)
-        out = Path(dest_dir) / f"{src.stem}_compressed.mp4"
-
-        vf = []
-        if target_height > 0 and probe["height"] > 0:
-            tw, th = self._target_scale(probe["width"], probe["height"], target_height)
-            if tw > 0 and th > 0:
-                vf.append(f"scale={tw}:{th}")
-        vf.append("format=yuv420p")  # 保证各平台兼容
-        vf.append("setsar=1")
-
-        cmd = [self._ffmpeg_bin(), "-y", "-v", "warning", "-i", str(src)]
-        cmd += ["-vf", ",".join(vf)]
-        cmd += ["-c:v", "libx264", "-preset", preset]
-        if target_bitrate:
-            cmd += ["-b:v", target_bitrate, "-maxrate", target_bitrate, "-bufsize", "2M"]
-        else:
-            cmd += ["-crf", str(int(crf))]
-        cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
-        # 产物走文件投递而非 HTTP 渐进播放，无需 faststart 二次封装，省一趟整文件回写
-        cmd += ["-progress", "pipe:1", "-nostats", str(out)]
-
-        total_s = probe["duration"] or 0.0
-        logger.info(
-            f"[mailvideo] 开始压缩: {src.name} | 源 {self._human_size(src_size)}"
-            + (f" | {probe['width']}x{probe['height']}" if probe["width"] else "")
-            + (f" | 时长 {total_s:.0f}s" if total_s else "")
-            + f" | 目标 {target_bitrate or f'CRF {crf}'}"
-            + (f" | 高度 {target_height}p" if target_height else "")
-        )
-
-        start = time.time()
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
-        )
-        err_lines: list[str] = []
-        threading.Thread(
-            target=self._drain_stderr, args=(proc, err_lines), daemon=True
-        ).start()
-
-        last_log = 0.0
-        out_time_s = 0.0
-        speed_x = 0.0
-        try:
-            for raw in proc.stdout:  # type: ignore[union-attr]
-                line = raw.strip()
-                if line.startswith("out_time_ms="):
-                    try:
-                        out_time_s = int(line.split("=", 1)[1]) / 1_000_000
-                    except ValueError:
-                        continue
-                    now = time.time()
-                    if now - last_log >= self.progress_interval:
-                        last_log = now
-                        self._log_compress_progress(
-                            out, out_time_s, total_s, start, speed_x, ""
-                        )
-                elif line.startswith("speed="):
-                    try:
-                        speed_x = float(line.split("=", 1)[1].replace("x", ""))
-                    except ValueError:
-                        pass
-            proc.wait(timeout=self.download_timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            raise VideoFetchError(f"压缩超时（>{self.download_timeout}s）")
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-
-        if not out.exists() or out.stat().st_size == 0:
-            tail = [l for l in err_lines if l.strip()][-3:]
-            raise VideoFetchError("压缩未生成有效文件: " + " | ".join(tail))
-
-        new_size = out.stat().st_size
-        ratio = (1 - new_size / src_size) * 100 if src_size else 0
-        self._log_compress_progress(out, total_s, total_s, start, 0.0, "✅ 压缩完成")
-        logger.info(
-            f"[mailvideo] 压缩结果: {self._human_size(src_size)} -> "
-            f"{self._human_size(new_size)}（省 {ratio:.0f}%）| 耗时 {time.time() - start:.1f}s"
-        )
-        return {
-            "path": str(out),
-            "title": out.stem,
-            "filesize": new_size,
-            "src_filesize": src_size,
-            "probe": probe,
-        }
-
-    def _log_compress_progress(
-        self, out: Path, out_time_s: float, total_s: float,
-        start: float, speed_x: float, head: str = ""
-    ):
-        try:
-            size = out.stat().st_size if out.exists() else 0
-        except OSError:
-            size = 0
-        elapsed = max(time.time() - start, 0.001)
-        pct = "—"
-        if total_s > 0:
-            pct = "100.0%" if head.startswith("✅") else f"{min(out_time_s / total_s * 100, 99.9):.1f}%"
-        tag = head or "⏳ 压缩中"
-        spd = f" | {speed_x:.2f}x 实时" if speed_x > 0 else f" | 均速 {elapsed and out_time_s / elapsed:.2f}x"
-        logger.info(
-            f"[mailvideo] {tag} {Path(out).name} | 已输出 {self._human_size(size)}"
-            f" | 进度 {pct} ({out_time_s:.0f}s/{total_s:.0f}s){spd} | 耗时 {elapsed:.1f}s"
-        )
 
     def _within_size_limit(self, media_url: str, max_size_mb: int, referer: str = "") -> bool:
         """读取 m3u8 播放列表，估算总体积/时长是否在限制内。
