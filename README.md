@@ -99,6 +99,48 @@
 
 三个站点按 1→2→3 顺序取第一个「已启用且非空」的地址；启用后直连该站点，完全跳过邮件取址。全部不启用时才走「发信→等回信」流程。
 
+> **填发布页还是真实站？** 添狗（tiangou）系这类站，官网标称的「永久域名」（如 `www.tiangou2.cc`）只是**地址发布页**，页面上根本没有视频。启用站点适配器后，直接填永久发布页即可——插件会自动从发布页里解析出当前真实站点（真实域名经常换，写死会失效）。
+
+### 站点适配器（SPA / JSON API 站）
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `enable_site_adapters` | `true` | 启用站点适配器。命中则短路通用解析，不适配的站点完全不受影响 |
+| `melon_search_pages` | `3` | 吃瓜栏目搜索翻页数（每页 14 条，`0` = 不搜吃瓜） |
+| `segment_host_fallbacks` | `ts2.zblsjy.com` | 分片 CDN 镜像域名，m3u8 里的分片域名失效时按顺序探测替换 |
+
+有些站（如添狗 `tiangou` 系）用通用规则**永远抓不到**，因为：
+
+1. 任何路径（`/index.htm`、`/type/10.htm`、`/search.htm`）都返回**同一份** JS 壳，内容是 `document.write(decodeURIComponent("..."))`，浏览器里看得见、`requests`/BeautifulSoup 里只有一段转义字符串；
+2. 视频列表由前端 Vue 请求 JSON 接口渲染，服务器 HTML 里没有任何 `<a>` 指向视频；
+3. 播放页也是壳，播放地址是前端用 `serial_number` 拼出来的 m3u8，页面里搜不到直链；
+4. 标题还做了单字符替换表混淆（`decrypt-text`）。
+
+适配器 `core/site_adapters.py` 针对这类结构走真实接口：
+
+```
+发布页 → (实体解码 + 探测 /data.json) → 真实站点
+搜索   → GET {真实站}/search.json?search={关键词}&{csstime}
+详情   → GET {真实站}/video/{id}.json        # 只有 serial_number，没有播放地址
+播放   → {novel_domain}/m3u8/{serial_number}/index_domain.m3u8?{csstime}
+标题   → decrypt-text 替换表还原 + HTML 实体反转义
+```
+
+**吃瓜（melon）栏目**额外接了一套：
+
+```
+搜索   → GET {真实站}/melons_0_{页码}.json    # 没有关键词接口，只能拉列表
+         → 解密标题后本地过滤（最多 melon_search_pages 页）
+详情   → GET {真实站}/melon/{id}.json         # melon.serial_number + melon_videos[].path
+播放   → {novel_domain}/melon_m3u8/{serial}/{path}/index_domain.m3u8?{csstime}
+```
+
+吃瓜条目常有多段（`video_0`、`video_1`…），适配器会先探测哪些段真的能拉，按顺序返回，下载器取第一个成功的。
+
+**分片域名自救：** 站点换 CDN 后，m3u8 里的分片域名可能已失效，而同一份分片在镜像域名下路径完全一致（实测 `ts2.ywqishu.com` 全线超时、`ts2.zblsjy.com` 正常 200）。适配器会抓 2KB 分片实测，确认镜像可用后把它登记进下载器的域名改写表，分片与密钥请求整批换域名；`segment_host_fallbacks` 可以自己补镜像。注意分片 CDN 是**直连优先**——走代理常常返回 200 但 0 字节。
+
+`csstime` / `novel_domain` 从真实站 `/data.json` 读取，不写死，站点换 CDN 也能跟上。以后要加别的站，只需在 `core/site_adapters.py` 里新增一个带 `search()` / `media_urls()` 的适配器类，并注册进 `SiteAdapters.items`。
+
 ### 地址提取
 
 | 配置项 | 默认 | 说明 |
@@ -148,6 +190,11 @@
 - 该站可能不被 yt-dlp 支持，或搜索 URL 模板不对。请据该站实际搜索地址调整 `search_url_template`；
 - 需要登录/风控的站，可填 `cookie`；
 - 境外站点可尝试配置 `http_proxy`。
+
+**Q：明明浏览器能打开、能看片，插件却一个候选都搜不到？**
+- 典型是「SPA + JSON API」站（页面是 JS 壳，数据走接口，播放地址前端拼接）。自 v1.4.4 起内置站点适配器，`enable_site_adapters` 保持开启即可；
+- 添狗（`tiangou`）系还要注意：`site_1_address` 填**永久发布页**（如 `www.tiangou2.cc`）就行，别填那种带端口的一次性真实域名——真实站会变，发布页不会；
+- 日志里出现 `适配器：发布页 xxx → 真实站 yyy` 表示已自动反查到真实站；出现 `适配器请求失败 .../data.json` 属正常（发布页本来就没有这个文件）。
 
 **Q：视频发不出来？**
 - 多数平台视频消息有大小限制（QQ 通常 ≤100MB）。超过 `max_video_size_mb`（默认 1024MB）时会自动改为返回直链；

@@ -75,7 +75,7 @@
     "description": "【固定站点1】地址",
     "type": "string",
     "default": "",
-    "hint": "例如 https://example.cc/。启用后直连该地址，跳过邮件取址。"
+    "hint": "例如 https://example.cc/。启用后直连该地址，跳过邮件取址。tiangou 系可直接填永久发布页（如 www.tiangou2.cc），开启站点适配器后会自 动解析出当前真实站点。"
   },
   "site_2_enabled": {
     "description": "【固定站点2】启用",
@@ -212,5 +212,23 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，HLS 分片与直链分段走 HTTP/2，单个连接可并发多个请求，减少握手和队头阻塞，对「多小分片」提速明显；需要 h2 依赖，且仅对 HTTPS 媒体生效。个别老 CDN/代理不兼容 h2 时，程序会自动回退 HTTP/1.1；也可手动关闭强制走 1.1。"
+  },
+  "enable_site_adapters": {
+    "description": "【站点适配】启用 SPA 站点适配器（tiangou 系：发布页 → 真实站 → JSON 接口搜索 → 拼接 m3u8）",
+    "type": "bool",
+    "default": true,
+    "hint": "这类站的页面是 JS 壳（document.write(decodeURIComponent(...))），视频列表全在 /search.json 等接口里，播放地址由 serial_number 前端拼成 m3u8，通用 HTML 规则一条都抓不到，必须靠适配器。开启后：填发布页（如 www.tiangou2.cc）会自动反查真实站点；关闭则退回纯通用解析。"
+  },
+  "melon_search_pages": {
+    "description": "【站点适配】吃瓜栏目搜索翻页数（每页 14 条，0 = 不搜吃瓜）",
+    "type": "int",
+    "default": 3,
+    "hint": "吃瓜（melon）栏目没有关键词搜索接口，只能拉列表、解密标题后本地过滤。翻得越多命中率越高，但每次搜索会多几个请求（每页约 50KB）。默认 3 页≈42 条，够常用关键词命中；想翻全站可调到 10 以上（全站约 37 页）。"
+  },
+  "segment_host_fallbacks": {
+    "description": "【站点适配】分片 CDN 镜像域名（逗号分隔，m3u8 里的分片域名失效时按顺序探测替换）",
+    "type": "string",
+    "default": "ts2.zblsjy.com",
+    "hint": "站点换 CDN 后，m3u8 里常残留已失效的分片域名（实测同一份分片在 ts2.ywqishu.com 全线超时、在 ts2.zblsjy.com 正常）。填一个能出货的镜像域名即可，工具会先探测 2KB 分片确认可用，再登记整批替换，路径不变。留空则不启用替换。"
   }
 }

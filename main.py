@@ -94,7 +94,7 @@ _SELECT_RE = re.compile(r"^(?:选|选择|第)?[#＃]?(\d{1,2})(?:号|个|条)?$"
 _CANCEL_WORDS = {"取消", "算了", "放弃", "不要了", "不用了", "退出", "cancel", "q"}
 
 
-@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.3",
+@register(PLUGIN_NAME, "WorkBuddy", "邮箱取址视频搜索", "1.4.5",
           "https://github.com/kimyoung666/astrbot_plugin_mailvideo")
 class MailVideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -148,6 +148,14 @@ class MailVideoPlugin(Star):
             auto_probe_direct=bool(self._cfg("auto_probe_direct", True)),
             probe_timeout=int(self._cfg("probe_timeout", 5) or 5),
             http2=bool(self._cfg("http2", True)),
+            # 站点适配器：SPA + JSON API 站（如 tiangou 系）必须靠它才能搜到
+            enable_site_adapters=bool(self._cfg("enable_site_adapters", True)),
+            # 吃瓜栏目没有关键词接口，最多翻几页列表再本地过滤标题（0 = 不搜）
+            melon_search_pages=int(self._cfg("melon_search_pages", 3) or 0),
+            # 分片 CDN 镜像：m3u8 里的分片域名失效时按顺序探测替换
+            segment_host_fallbacks=str(
+                self._cfg("segment_host_fallbacks", "ts2.zblsjy.com") or ""
+            ),
         )
 
     def _preferred_template(self, base: str) -> str:

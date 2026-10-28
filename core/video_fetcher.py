@@ -26,6 +26,51 @@ from astrbot.api import logger
 
 __all__ = ["VideoFetcher", "VideoFetchError"]
 
+
+# ====================================================================== #
+# 站点适配器（SPA / JSON API 站）
+# ====================================================================== #
+def _load_site_adapters_module():
+    """按文件路径加载同目录的 ``site_adapters``。
+
+    与 ``main.py`` 的动态加载约定保持一致：用唯一模块名 + 源文件 mtime
+    版本戳，改完文件能自动重载，也不会和别的插件同名模块撞车。
+    """
+    import importlib.util
+    import sys as _sys
+
+    name = "astrbot_plugin_mailvideo_core.site_adapters"
+    path = Path(__file__).resolve().parent / "site_adapters.py"
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+
+    cached = _sys.modules.get(name)
+    if cached is not None and getattr(cached, "__mf_source_stamp__", None) == stamp:
+        return cached
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover
+        raise ImportError(f"无法加载适配器模块: {path}")
+    module = importlib.util.module_from_spec(spec)
+    module.__mf_source_stamp__ = stamp
+    _sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_site_adapters(fetcher, enabled: bool = True, melon_pages: int = 3):
+    """构建适配器集合；加载失败时返回 None，插件照常走通用流程。"""
+    if not enabled:
+        return None
+    try:
+        module = _load_site_adapters_module()
+        return module.SiteAdapters(fetcher, enabled=True, melon_pages=melon_pages)
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"[mailvideo] 站点适配器加载失败，按通用流程运行: {e}")
+        return None
+
 _MEDIA_EXT = (".mp4", ".m3u8", ".flv", ".mkv", ".ts", ".avi", ".mov", ".webm", ".f4v")
 _VIDEO_PATH_HINTS = (
     "video",
@@ -86,6 +131,9 @@ class VideoFetcher:
         auto_probe_direct: bool = True,
         probe_timeout: int = 5,
         http2: bool = True,
+        enable_site_adapters: bool = True,
+        melon_search_pages: int = 3,
+        segment_host_fallbacks: str = "",
     ) -> None:
         raw = (search_url_template or "{base}/search?wd={keyword}").strip()
         # 支持用 "||" 或换行分隔多个候选模板：按顺序尝试，第一个返回真实结果的模板生效。
@@ -137,12 +185,24 @@ class VideoFetcher:
         self._force_hosts = self._parse_hosts(proxy_force_hosts)
         # host -> True(直连) / False(走代理)，探测一次后长期复用
         self._host_route: dict[str, bool] = {}
+        # ── 分片域名改写 ──────────────────────────────────────────── #
+        # 站点换 CDN 时，m3u8 里常残留已失效的分片域名（实测同一个文件在
+        # ts2.ywqishu.com 全超时、在 ts2.zblsjy.com 正常）。适配器探测到可用
+        # 镜像后注册改写，分片/密钥请求统一换域名。
+        self._host_rewrites: dict[str, str] = {}
+        self.segment_host_fallbacks: list[str] = self._parse_hosts(segment_host_fallbacks)
         self._route_lock = threading.Lock()
         # host -> 探测单飞锁（同一域名并发首访只探一次）
         self._host_probe_locks: dict[str, threading.Lock] = {}
         # 共享连接池：按用途分桶，替代「每个分片新建一个 Client」
         self._shared_clients: dict[str, object] = {}
         self._client_lock = threading.Lock()
+        # ── 站点适配器 ────────────────────────────────────────────── #
+        # SPA + JSON API 站（页面是壳、数据走 JSON、播放地址前端拼接）用
+        # 通用 HTML 规则永远抓不到，交给适配器短路处理；不适配则返回 None。
+        self._site_adapters = _build_site_adapters(
+            self, enable_site_adapters, melon_pages=melon_search_pages
+        )
 
     # ============================================================== #
     # 工具
@@ -200,6 +260,18 @@ class VideoFetcher:
         命中信息记在 ``self.last_search``，调用方据此持久化模板偏好。
         """
         self.last_search = {}
+        # ── 站点适配器优先：命中则短路，不适配（返回 None）才走通用流程 ──
+        if self._site_adapters is not None:
+            adapted = self._site_adapters.search(base, keyword)
+            if adapted is not None:
+                if adapted:
+                    self.last_search = {
+                        "template": "adapter",
+                        "url": base,
+                        "method": "adapter",
+                    }
+                logger.info(f"[mailvideo] 适配器接管搜索，候选 {len(adapted)} 个")
+                return adapted
         # 原始模板与渲染后 URL 成对保留：记住的是「哪个模板」（不含关键词），
         # 这样换关键词也能直接命中，不用每次重走废模板。
         pairs = list(zip(self.search_templates, self.build_search_urls(base, keyword)))
@@ -404,12 +476,44 @@ class VideoFetcher:
                 headers["Referer"] = referer
         return headers
 
+    # ── 分片域名改写（站点换 CDN 后的自救） ────────────────────── #
+    def register_host_rewrite(self, old_host: str, new_host: str) -> None:
+        """登记「旧分片域名 → 可用镜像域名」，之后的分片/密钥请求自动改写。"""
+        old_host = (old_host or "").strip().lower()
+        new_host = (new_host or "").strip().lower()
+        if not old_host or not new_host or old_host == new_host:
+            return
+        if self._host_rewrites.get(old_host) == new_host:
+            return
+        self._host_rewrites[old_host] = new_host
+        logger.info(f"[mailvideo] 分片域名改写登记: {old_host} → {new_host}")
+
+    def _rewrite_media_url(self, url: str) -> str:
+        """按登记表替换分片 URL 的域名；没有登记则原样返回。"""
+        if not self._host_rewrites or not url:
+            return url
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return url
+        new_host = self._host_rewrites.get((parsed.netloc or "").lower())
+        if not new_host:
+            return url
+        return parsed._replace(netloc=new_host).geturl()
+
     def _extract_media_urls(self, page_url: str) -> list[str]:
         """从播放页 HTML 中提取全部媒体直链（m3u8/mp4），按 HLS 优先排序。
 
         很多站点不在页面里直接给 <video src>，而是把播放地址写进内联 JSON
         （常见 ``"\\/"`` 转义斜杠）。这里统一反转义后正则抓取。
         """
+        # ── 站点适配器优先：SPA 播放页的地址是前端拼的，正则永远抓不到 ──
+        if self._site_adapters is not None:
+            adapted = self._site_adapters.media_urls(page_url)
+            if adapted:
+                logger.info(f"[mailvideo] 适配器解析出媒体直链: {adapted[0][:120]}")
+                return adapted
+
         try:
             import httpx
 
@@ -521,7 +625,11 @@ class VideoFetcher:
                     time.sleep(2)
 
             # 2) HLS 备选：ffmpeg 串行拉流（m3u8 动态变化时更宽容）
-            if is_hls and self.ffmpeg_available():
+            #    分片域名改写只对并行路径生效：ffmpeg 自己解析 m3u8，会照着
+            #    已失效的域名去拉，白等到超时，这种情况直接跳过。
+            if is_hls and self.ffmpeg_available() and self._host_rewrites:
+                logger.info("[mailvideo] 分片域名已改写，跳过 ffmpeg 远端拉流")
+            elif is_hls and self.ffmpeg_available():
                 logger.info("[mailvideo] 降级走 ffmpeg 串行拉流")
                 try:
                     return self._download_via_ffmpeg(
@@ -644,7 +752,9 @@ class VideoFetcher:
                 if m_iv:
                     key_iv = m_iv.group(1)
                 if key_method != "NONE" and m_uri:
-                    key_url = _urlparse.urljoin(final_url, m_uri.group(1))
+                    key_url = self._rewrite_media_url(
+                        _urlparse.urljoin(final_url, m_uri.group(1))
+                    )
                     try:
                         kr = client.get(key_url, timeout=self.timeout)
                         kr.raise_for_status()
@@ -676,7 +786,7 @@ class VideoFetcher:
                     dur = float(target_dur)
                 segments.append({"url": None, "duration": dur})
             elif line and not line.startswith("#"):
-                full_url = _urlparse.urljoin(final_url, line)
+                full_url = self._rewrite_media_url(_urlparse.urljoin(final_url, line))
                 if segments and segments[-1]["url"] is None:
                     segments[-1]["url"] = full_url
                 else:
