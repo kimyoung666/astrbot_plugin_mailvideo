@@ -282,29 +282,20 @@ def case_a():
     f = VideoFetcher()
     check("A1 默认 HLS 并发 = 24", f.hls_parallel_workers == 24,
           f"实际 {f.hls_parallel_workers}")
-    check("A2 默认直链并发 = 12", f.direct_parallel_workers == 12,
-          f"实际 {f.direct_parallel_workers}")
 
-    g = VideoFetcher(hls_parallel_workers=24, direct_parallel_workers=12, http2=False)
+    g = VideoFetcher(hls_parallel_workers=24, http2=False)
     seg = g._shared_client("http://127.0.0.1:9/a.m3u8", kind="seg")
     lim = pool_of(seg)
-    check("A3 HLS 池上限 = 线程数×2 = 48", lim["max"] == 48, f"{lim}")
-    check("A4 HLS keepalive 连接数 = 24", lim["keepalive"] == 24)
-    check("A5 keepalive_expiry = 30s", lim["expiry"] == 30.0, f"{lim['expiry']}")
-
-    rng = g._shared_client("http://127.0.0.1:9/a.mp4", kind="range")
-    lim2 = pool_of(rng)
-    check("A6 直链池按自己的线程数开 = 12×2 = 24", lim2["max"] == 24, f"{lim2}")
-    check("A7 直链 keepalive_expiry 也是 30s", lim2["expiry"] == 30.0)
-    check("A8 同 URL 同用途拿到同一个 Client",
-          g._shared_client("http://127.0.0.1:9/a.mp4", kind="range") is rng)
-    check("A9 m3u8/密钥/分片同一分桶（同一 Client）",
+    check("A2 HLS 池上限 = 线程数×2 = 48", lim["max"] == 48, f"{lim}")
+    check("A3 HLS keepalive 连接数 = 24", lim["keepalive"] == 24)
+    check("A4 keepalive_expiry = 30s", lim["expiry"] == 30.0, f"{lim['expiry']}")
+    check("A5 m3u8/密钥/分片同一分桶（同一 Client）",
           g._shared_client("http://127.0.0.1:9/a.m3u8") is seg)
-    check("A10 直链桶与 HLS 桶互不串",
-          g._shared_client("http://127.0.0.1:9/a.mp4", kind="range") is not seg)
+    check("A6 同一分桶只建一个 Client", len(g._shared_clients) == 1,
+          f"{list(g._shared_clients)}")
 
     g.close()
-    check("A11 close() 清空全部连接池", not g._shared_clients)
+    check("A7 close() 清空全部连接池", not g._shared_clients)
 
 
 # --------------------------------------------------------------------------- #
@@ -352,34 +343,6 @@ def case_b(base: str, src: Path, seg_count: int):
 
 
 # --------------------------------------------------------------------------- #
-# C. 直链 Range：探测 + 12 段 = 1 个 Client
-# --------------------------------------------------------------------------- #
-def case_c(base: str, big: Path):
-    print("\nC. 直链 Range 分段：探测 + 12 段共用一个 Client")
-    HITS.clear()
-    f = VideoFetcher(direct_parallel_workers=12, direct_parallel_min_mb=1, timeout=10)
-    out = fresh_dir("out_range")
-    with _Counter() as ctr:
-        res = f._download_direct(f"{base}/big.mp4", out)
-
-    n_seg = len([h for h in HITS if h[2].startswith("bytes=") and h[2] != "bytes=0-0"])
-    check("C1 整任务只建了 1 个 httpx.Client", len(ctr.created) == 1,
-          f"实际建了 {len(ctr.created)} 个")
-    check("C2 12MB 切成 12 段下载", n_seg == 12, f"实际 {n_seg} 段")
-    check("C3 探测与分段同池同 Client",
-          bool(f._shared_clients.get("range:direct")) and
-          f._shared_clients["range:direct"] is ctr.created[0])
-    check("C4 连接池活着连接数 ≤ 12",
-          (pool_of(ctr.created[0])["live"] or 0) <= 12,
-          f"活连接 {pool_of(ctr.created[0])['live']}")
-    got = Path(res["path"])
-    check("C5 与源文件字节一致", md5(got) == md5(big))
-    check("C6 体积一致", got.stat().st_size == big.stat().st_size,
-          f"{got.stat().st_size} vs {big.stat().st_size}")
-    f.close()
-
-
-# --------------------------------------------------------------------------- #
 # D. close() 之后能重建池
 # --------------------------------------------------------------------------- #
 def case_d():
@@ -402,7 +365,6 @@ def main():
 
     case_a()
     case_b(base, src, seg_count)
-    case_c(base, big)
     case_d()
 
     srv.shutdown()

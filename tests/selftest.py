@@ -170,14 +170,14 @@ class TestMailClient(unittest.TestCase):
 class TestVideoFetcher(unittest.TestCase):
     def test_build_search_url(self):
         f = VideoFetcher(search_url_template="{base}/search?wd={keyword}")
-        url = f.build_search_url("https://site.top/", "复仇者 联盟")
+        url = f.build_search_urls("https://site.top/", "复仇者 联盟")[0]
         self.assertTrue(url.startswith("https://site.top/search?wd="))
         self.assertNotIn(" ", url)  # 关键词已编码
 
     def test_build_search_url_custom_template(self):
         f = VideoFetcher(search_url_template="{base}/index.php/vod/search.html?wd={keyword}")
         self.assertEqual(
-            f.build_search_url("https://s.cc", "abc"),
+            f.build_search_urls("https://s.cc", "abc")[0],
             "https://s.cc/index.php/vod/search.html?wd=abc",
         )
 
@@ -193,9 +193,8 @@ class TestVideoFetcher(unittest.TestCase):
         )
         self.assertTrue(urls[1].startswith("https://site.top/search/"))
         self.assertTrue(urls[1].endswith("/"))
-        # 单值接口仍返回第一个
-        self.assertEqual(f.build_search_url("https://site.top/", "abc"),
-                         "https://site.top/search?query=abc")
+        # 第一个模板即默认模板
+        self.assertEqual(urls[0].startswith("https://site.top/search?query="), True)
 
     def test_build_search_url_newline_separated(self):
         raw = "{base}/search?wd={keyword}\n{base}/search/{keyword}/"

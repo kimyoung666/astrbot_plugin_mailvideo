@@ -135,13 +135,10 @@ class MailVideoPlugin(Star):
                 self._cfg("search_url_template", "{base}/search?wd={keyword}")
             ).strip()
             or "{base}/search?wd={keyword}",
-            max_results=int(self._cfg("max_results", 1) or 1),
             cookie=str(self._cfg("cookie", "") or ""),
             proxy=str(self._cfg("http_proxy", "") or ""),
             ffmpeg_path=str(self._cfg("ffmpeg_path", "") or ""),
             hls_parallel_workers=int(self._cfg("hls_parallel_workers", 24) or 24),
-            direct_parallel_workers=int(self._cfg("direct_parallel_workers", 12) or 0),
-            direct_parallel_min_mb=int(self._cfg("direct_parallel_min_mb", 4) or 4),
             # 媒体域名分流：站点页面恒走代理，视频 CDN 自动判定直连/代理
             proxy_bypass_hosts=str(self._cfg("proxy_bypass_hosts", "") or ""),
             proxy_force_hosts=str(self._cfg("proxy_force_hosts", "") or ""),
@@ -156,6 +153,9 @@ class MailVideoPlugin(Star):
             segment_host_fallbacks=str(
                 self._cfg("segment_host_fallbacks", "ts2.zblsjy.com") or ""
             ),
+            # 码率上限：master playlist 有多档清晰度时选「不超过上限的最高档」，
+            # 下载和上行一起变快（0 = 老行为，一律最高画质）
+            prefer_max_bitrate_mbps=float(self._cfg("prefer_max_bitrate_mbps", 0) or 0),
         )
 
     def _preferred_template(self, base: str) -> str:
@@ -210,26 +210,24 @@ class MailVideoPlugin(Star):
     # ================================================================== #
     # 指令
     # ================================================================== #
-    @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE)
-    async def on_private_message(self, event: AstrMessageEvent):
-        """私聊钩子：用户发消息时，优先补发该会话暂存的「待投递」结果
-        （如长流程结束后因 QQ 官方主动消息窗口过期而没发出去的视频）。"""
-        await self._deliver_pending_if_any(event)
-
     @filter.event_message_type(EventMessageType.ALL)
     async def on_any_message(self, event: AstrMessageEvent):
-        """拦截「候选选择」的回复：只有该会话有待选候选、且文本是序号/取消时才响应，
-        处理完直接终止事件传播，避免再被 LLM 或其它插件接走。"""
+        """用户发消息时的统一钩子，只做两件事：
+
+        1. 补发该会话暂存的「待投递」结果（长流程结束后平台窗口过期的兜底）；
+        2. 拦截候选选择的序号回复，处理完终止事件传播，避免被 LLM 接走。
+        """
         try:
+            if not self._allowed(event):
+                return
+            await self._deliver_pending_if_any(event)
             text = (event.message_str or "").strip()
             if not text or text[0] in "/!！":
                 return  # 指令交给 cmd_video 处理
-            if not self._allowed(event):
-                return
             if await self._try_handle_selection(event, text):
                 event.stop_event()
         except Exception as e:
-            logger.error(f"[mailvideo] 候选选择处理异常: {e}")
+            logger.error(f"[mailvideo] 消息钩子处理异常: {e}")
 
     @filter.command("搜片")
     async def cmd_video(self, event: AstrMessageEvent):
@@ -413,7 +411,7 @@ class MailVideoPlugin(Star):
 
         suffix = f"（{tag}）" if tag else ""
         _send_started = time.time()
-        ok = await self._send_video(umo, path)
+        ok = await self._send_video(umo, path, fetcher)
         send_seconds = time.time() - _send_started
         if ok:
             # 发送完成：立即删除本地视频与本次任务的缓存目录，
@@ -662,7 +660,7 @@ class MailVideoPlugin(Star):
                 self._stash_pending(umo, {"type": "text", "text": text})
             return False
 
-    async def _send_video(self, umo: str, path: Path) -> bool:
+    async def _send_video(self, umo: str, path: Path, fetcher=None) -> bool:
         """发送视频文件，成功返回 True。
 
         QQ 官方平台仅允许在用户发消息后 5 分钟内主动消息（最多 5 条），
@@ -670,6 +668,24 @@ class MailVideoPlugin(Star):
         刷新窗口），仍失败则暂存为「待投递」，等用户下次发消息时补发。
         """
         send_as = str(self._cfg("send_as", "video") or "video").lower()
+
+        # ── 发送前瘦身（可选）──
+        # 平台上传是整包上行，慢的根本原因是字节数，不是并发。超过阈值就
+        # 先压到目标体积；压不动/失败一律忽略，绝不影响正常发送。
+        shrink_over = float(self._cfg("send_shrink_over_mb", 0) or 0)
+        if shrink_over > 0 and fetcher is not None:
+            try:
+                res = await asyncio.to_thread(
+                    fetcher.shrink_for_send,
+                    path,
+                    shrink_over,
+                    int(self._cfg("send_shrink_height", 720) or 720),
+                )
+                if not res.get("skipped"):
+                    path = Path(res["path"])
+            except Exception as e:
+                logger.warning(f"[mailvideo] 发送前瘦身异常（忽略）: {e}")
+
         try:
             size_mb = path.stat().st_size / 1024 / 1024
         except OSError:

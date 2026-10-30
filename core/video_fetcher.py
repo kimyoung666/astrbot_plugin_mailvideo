@@ -117,15 +117,12 @@ class VideoFetcher:
     def __init__(
         self,
         search_url_template: str = "{base}/search?wd={keyword}",
-        max_results: int = 1,
         cookie: str = "",
         proxy: str = "",
         ffmpeg_path: str = "",
         timeout: int = 30,
         download_timeout: int = 1800,
         hls_parallel_workers: int = 24,
-        direct_parallel_workers: int = 12,
-        direct_parallel_min_mb: int = 4,
         proxy_bypass_hosts: str = "",
         proxy_force_hosts: str = "",
         auto_probe_direct: bool = True,
@@ -134,6 +131,7 @@ class VideoFetcher:
         enable_site_adapters: bool = True,
         melon_search_pages: int = 3,
         segment_host_fallbacks: str = "",
+        prefer_max_bitrate_mbps: float = 0.0,
     ) -> None:
         raw = (search_url_template or "{base}/search?wd={keyword}").strip()
         # 支持用 "||" 或换行分隔多个候选模板：按顺序尝试，第一个返回真实结果的模板生效。
@@ -141,18 +139,14 @@ class VideoFetcher:
         self.search_templates: list[str] = [
             t.strip() for t in re.split(r"\s*(?:\|\||\n)\s*", raw) if t.strip()
         ] or ["{base}/search?wd={keyword}"]
-        # 保留单模板字段，向后兼容旧测试/外部引用
-        self.search_url_template = self.search_templates[0]
-        self.max_results = max(1, int(max_results))
         self.cookie = cookie or ""
         self.proxy = proxy or ""
         self.ffmpeg_path = ffmpeg_path or ""
         self.timeout = timeout
         # 单次下载的硬超时（秒）。长片 + 慢源需要留足余量。
         self.download_timeout = max(60, int(download_timeout or 1800))
-        # 预检阶段解析出的时长/体积缓存（media_url -> 秒 / 字节），供下载进度显示
+        # 预检阶段解析出的时长（media_url -> 秒），供下载进度显示
         self._duration_cache: dict[str, float] = {}
-        self._size_cache: dict[str, float] = {}
         # 日志里下载进度的刷新间隔（秒）
         self.progress_interval = 3.0
         # ── 搜索阶段调优 ──────────────────────────────────────────── #
@@ -168,10 +162,16 @@ class VideoFetcher:
         self.last_search: dict = {}
         # HLS 并行下载线程数（0 = 禁用并行，走 ffmpeg 串行）
         self.hls_parallel_workers = max(0, int(hls_parallel_workers or 0))
-        # 直链（单文件 mp4/flv 等）多连接 Range 并发下载
-        self.direct_parallel_workers = max(0, int(direct_parallel_workers or 0))
-        # 小于该体积的直链不做分片并发（小文件分段反而更慢）
-        self.direct_parallel_min_mb = max(1, int(direct_parallel_min_mb or 4))
+        # 码率上限（Mbps）：master playlist 有多档清晰度时，选「不超过上限的
+        # 最高一档」；0 = 老行为（一律最高画质）。QQ 端上传是整包上行，上行
+        # 带宽才是瓶颈，下 2.5Mbps 的档比下 8Mbps 再压缩快得多。
+        try:
+            self.prefer_max_bitrate_mbps = max(0.0, float(prefer_max_bitrate_mbps or 0))
+        except (TypeError, ValueError):
+            self.prefer_max_bitrate_mbps = 0.0
+        # 已解析过的播放列表（media_url -> (final_url, m3u8 文本)）。预检阶段
+        # 拉过一次，下载阶段直接复用，省掉一次往返 + 一次 TLS 等待。
+        self._playlist_cache: dict[str, tuple[str, str]] = {}
         # ── 媒体域名分流 ──────────────────────────────────────────── #
         # 站点页面请求恒走代理（多数站点直连被墙）；媒体下载（m3u8/密钥/
         # 分片/直链）按 host 逐个判定：能直连就直连，直连不通用代理。
@@ -236,10 +236,6 @@ class VideoFetcher:
             .replace("{keyword}", quote(keyword))
             .replace("{raw_keyword}", keyword)
         )
-
-    def build_search_url(self, base: str, keyword: str) -> str:
-        """拼第一个模板对应的搜索 URL（向后兼容）。"""
-        return self._fill_template(self.search_templates[0], base, keyword)
 
     def build_search_urls(self, base: str, keyword: str) -> list[str]:
         """按配置顺序拼出全部候选搜索 URL。"""
@@ -548,11 +544,6 @@ class VideoFetcher:
         )
         return found
 
-    def _extract_media_url(self, page_url: str) -> Optional[str]:
-        """兼容旧接口：只取最优的一条媒体直链。"""
-        urls = self._extract_media_urls(page_url)
-        return urls[0] if urls else None
-
     def download(
         self,
         url: str,
@@ -639,7 +630,7 @@ class VideoFetcher:
                     last_err = e
                     logger.warning(f"[mailvideo] ffmpeg 下载失败: {e}")
 
-            # 3) 交给 yt-dlp（含无扩展名的 HLS 与普通 mp4）
+            # 3) 交给 yt-dlp（含无扩展名的 HLS 与普通 mp4 直链）
             logger.info("[mailvideo] 降级走 yt-dlp")
             try:
                 return self._download_via_ytdlp(
@@ -653,15 +644,6 @@ class VideoFetcher:
                 last_err = e
                 logger.warning(f"[mailvideo] yt-dlp 下载失败: {e}")
                 self._clear_range_(dest_dir)
-
-            # 4) 直链兜底
-            if media_url.lower().endswith(_MEDIA_EXT):
-                logger.info("[mailvideo] 降级走直链下载")
-                try:
-                    return self._download_direct(media_url, dest_dir, headers)
-                except Exception as e:
-                    last_err = e
-                    logger.warning(f"[mailvideo] 直链下载失败: {e}")
 
         raise VideoFetchError(f"下载失败: {last_err}")
 
@@ -677,6 +659,58 @@ class VideoFetcher:
                         pass
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ 播放列表
+    def _pick_variant(
+        self,
+        text: str,
+        base_url: str,
+        client=None,
+        headers: Optional[dict] = None,
+    ) -> tuple[str, str, int]:
+        """在 master playlist 里选一路码流，返回 ``(final_url, m3u8 文本, 码率)``。
+
+        - 未配 ``prefer_max_bitrate_mbps``：取最高 BANDWIDTH（原行为）
+        - 配了上限：取不超过上限的最高一档；全都超上限时退回最低一档
+        ``client`` 为空时只选地址不抓内容（返回的文本为空串）。
+        """
+        if "#EXT-X-STREAM-INF" not in text:
+            return base_url, text, 0
+
+        lines = [ln.strip() for ln in text.splitlines()]
+        variants: list[tuple[int, str]] = []
+        for i, line in enumerate(lines):
+            if not line.startswith("#EXT-X-STREAM-INF"):
+                continue
+            m = re.search(r"BANDWIDTH=(\d+)", line)
+            bw = int(m.group(1)) if m else 0
+            for nxt in lines[i + 1:]:
+                if nxt and not nxt.startswith("#"):
+                    variants.append((bw, nxt))
+                    break
+        if not variants:
+            return base_url, text, 0
+
+        cap = self.prefer_max_bitrate_mbps * 1_000_000
+        if cap > 0:
+            under = [v for v in variants if v[0] <= cap]
+            bw, uri = (
+                max(under, key=lambda v: v[0]) if under
+                else min(variants, key=lambda v: v[0])
+            )
+        else:
+            bw, uri = max(variants, key=lambda v: v[0])
+
+        sub_url = urljoin(base_url, uri)
+        logger.info(
+            f"[mailvideo] 选流 {bw / 1_000_000:.2f}Mbps（共 {len(variants)} 档"
+            + (f"，上限 {self.prefer_max_bitrate_mbps:g}Mbps）" if cap > 0 else "，取最高）")
+        )
+        if client is None:
+            return sub_url, "", bw
+        resp = client.get(sub_url, headers=headers or self._http_headers(), timeout=self.timeout)
+        resp.raise_for_status()
+        return sub_url, resp.text, bw
 
     def _download_hls_parallel(
         self,
@@ -716,29 +750,21 @@ class VideoFetcher:
         # ── 1) 获取 m3u8（处理 master playlist）──
         # nullcontext 保留原有缩进结构，避免大幅重排代码
         with contextlib.nullcontext(client) as client:
-            resp = client.get(media_url, headers=headers, timeout=self.timeout)
-            resp.raise_for_status()
-            text = resp.text
-            final_url = media_url
-
-            if "#EXT-X-STREAM-INF" in text:
-                best_uri, best_bw = None, -1
-                lines = [l.strip() for l in text.splitlines()]
-                for i, line in enumerate(lines):
-                    if line.startswith("#EXT-X-STREAM-INF"):
-                        m = re.search(r"BANDWIDTH=(\d+)", line)
-                        bw = int(m.group(1)) if m else 0
-                        for nxt in lines[i + 1:]:
-                            if nxt and not nxt.startswith("#"):
-                                if bw > best_bw:
-                                    best_bw, best_uri = bw, nxt
-                                break
-                if best_uri:
-                    sub_url = _urlparse.urljoin(media_url, best_uri)
-                    resp = client.get(sub_url, timeout=self.timeout)
-                    resp.raise_for_status()
-                    text = resp.text
-                    final_url = sub_url
+            # 预检阶段已经拉过播放列表就直接复用：少一次 m3u8 往返，
+            # 也让「预检看到的档位」和「实际下载的档位」保持一致。
+            cached = self._playlist_cache.pop(media_url, None)
+            if cached:
+                final_url, text = cached
+                logger.info("[mailvideo] 复用预检播放列表（省一次 m3u8 请求）")
+            else:
+                resp = client.get(media_url, headers=headers, timeout=self.timeout)
+                resp.raise_for_status()
+                final_url = media_url
+                final_url, text, _bw = self._pick_variant(
+                    resp.text, final_url, client, headers
+                )
+                if _bw:
+                    logger.debug(f"[mailvideo] 自选档位 {_bw / 1_000_000:.2f}Mbps")
 
             # ── 2) 下载加密密钥（如果有）──
             key_file: Optional[Path] = None
@@ -886,6 +912,7 @@ class VideoFetcher:
                     )
 
         elapsed = time.time() - start
+        seg_s = elapsed  # 纯拉流耗时（不含合并），用于阶段耗时明细
         missing = [
             i for i in range(len(segments))
             if not (seg_dir / f"seg_{i:05d}.ts").exists()
@@ -910,7 +937,7 @@ class VideoFetcher:
                 if key_iv:
                     key_line += f",IV={key_iv}"
                 f.write(key_line + "\n")
-            f.write(f"#EXT-X-MEDIA-SEQUENCE:0\n")
+            f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
             f.write(f"#EXT-X-TARGETDURATION:{target_dur}\n")
             for i, seg in enumerate(segments):
                 f.write(f"#EXTINF:{seg['duration']:.3f},\n")
@@ -918,6 +945,7 @@ class VideoFetcher:
             f.write("#EXT-X-ENDLIST\n")  # 必须！否则 ffmpeg 当直播流无限等下一片
 
         # ── 7) ffmpeg 合并（自动解密）──
+        _t_mux = time.time()
         try:
             self._mux_local_playlist(local_m3u8, out)
         except Exception:
@@ -925,6 +953,7 @@ class VideoFetcher:
             if key_file:
                 key_file.unlink(missing_ok=True)
             raise
+        mux_s = time.time() - _t_mux
 
         # ── 8) 清理 ──
         shutil.rmtree(seg_dir, ignore_errors=True)
@@ -935,10 +964,13 @@ class VideoFetcher:
             raise VideoFetchError("合并后文件为空")
 
         size_bytes = out.stat().st_size
+        # 阶段耗时明细：下次喊「慢」的时候一眼看出是下载慢还是合并慢
         logger.info(
             f"[mailvideo] ✅ 并行下载完成 {out.name} | "
             f"{size_bytes/1024/1024:.2f}MB | "
-            f"总耗时 {time.time()-start:.1f}s"
+            f"总耗时 {time.time()-start:.1f}s "
+            f"（拉流 {seg_s:.1f}s / 合并 {mux_s:.1f}s / 均速 "
+            f"{size_bytes/max(seg_s,0.001)/1024/1024:.2f}MB/s）"
         )
         return {
             "path": str(out),
@@ -957,7 +989,13 @@ class VideoFetcher:
             "-c", "copy", "-bsf:a", "aac_adtstoasc",
             str(out),
         ]
-        timeout = 120
+        # 合并虽是纯封装（-c copy），但分片数一多，open/close 和落盘 IO
+        # 也不便宜：原来固定 120s 会把长片直接判死，这里按分片数放宽。
+        try:
+            seg_count = len(list(local_m3u8.parent.glob("seg_*.ts")))
+        except OSError:
+            seg_count = 0
+        timeout = max(120, min(1800, seg_count * 2 or 120))
 
         proc = subprocess.Popen(
             cmd,
@@ -1139,6 +1177,121 @@ class VideoFetcher:
     # ============================================================== #
     # 画质压缩
     # ============================================================== #
+    def _pick_video_encoder(self) -> list[str]:
+        """挑编码器参数：有 NVENC 用硬件（几乎不占 CPU），否则 libx264。
+
+        只在「发送前瘦身」这条可选路径上用到，失败会整条降级成不压缩，
+        所以这里直接探一次可用性，不做持久缓存。
+        """
+        nvenc = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "27"]
+        x264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "27"]
+        try:
+            probe = subprocess.run(
+                [self._ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x144:d=1",
+                 *nvenc, "-f", "null", "-"],
+                capture_output=True, timeout=20,
+            )
+            if probe.returncode == 0:
+                return nvenc
+        except Exception:
+            pass
+        return x264
+
+    def shrink_for_send(
+        self,
+        path: Path,
+        target_mb: float,
+        max_height: int = 720,
+    ) -> dict:
+        """把视频压到 ``target_mb`` 附近再发，返回体积变化信息。
+
+        QQ 视频消息是**整包上行**，上限速度就是本机上行带宽：500MB 的片子
+        在 5Mbps 上行上光上传就要十几分钟。先把码率压到「目标体积/时长」
+        对应值，上行字节直接砍掉大半，画质在手机屏幕上基本看不出差别。
+
+        代价是转码时间（2 核 libx264 veryfast 约 2~3x 实时），所以配置项
+        默认 0（关闭），只在明确会嫌传得慢的大文件场景打开。
+        调用失败一律返回 ``{"skipped": True}``，不影响正常发送。
+        """
+        path = Path(path)
+        out: dict = {"skipped": True, "path": str(path)}
+        try:
+            src_mb = path.stat().st_size / 1024 / 1024
+        except OSError:
+            return out
+        if src_mb <= target_mb:
+            return out
+        if not self.ffmpeg_available():
+            logger.warning("[mailvideo] 未检测到 ffmpeg，跳过发送前压缩")
+            return out
+
+        info = self.probe_video(path)
+        dur = float(info.get("duration") or 0)
+        if dur <= 0.5:
+            logger.warning("[mailvideo] 读不到时长，跳过发送前压缩")
+            return out
+
+        audio_kbps = 96
+        # 目标视频码率：目标体积按 95% 留余量，扣掉音频
+        v_kbps = int(target_mb * 0.95 * 1024 * 1024 * 8 / dur / 1000) - audio_kbps
+        v_kbps = max(200, min(v_kbps, int(info.get("bitrate") or 0) // 1000 or v_kbps))
+
+        cmd = [self._ffmpeg_bin(), "-y", "-nostdin", "-v", "warning", "-i", str(path)]
+        height = int(info.get("height") or 0)
+        if max_height and height > max_height:
+            cmd += ["-vf", f"scale=-2:{max_height}"]
+        cmd += self._pick_video_encoder()
+        cmd += [
+            "-b:v", f"{v_kbps}k",
+            "-maxrate", f"{int(v_kbps * 1.3)}k",
+            "-bufsize", f"{int(v_kbps * 2)}k",
+            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            "-movflags", "+faststart",
+            str(path.with_name(f"{path.stem}.send.mp4")),
+        ]
+
+        logger.info(
+            f"[mailvideo] 发送前瘦身: {src_mb:.1f}MB → 目标 {target_mb:.0f}MB"
+            f"（{v_kbps}kbps，{dur:.0f}s）…"
+        )
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(120, int(dur * 2)))
+        except subprocess.TimeoutExpired:
+            logger.warning("[mailvideo] 压缩超时，改为直接发送原文件")
+            return out
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()[-2:]
+            logger.warning(f"[mailvideo] 压缩失败，改为直接发送原文件: {' | '.join(tail)}")
+            try:
+                path.with_name(f"{path.stem}.send.mp4").unlink(missing_ok=True)
+            except OSError:
+                pass
+            return out
+
+        new = path.with_name(f"{path.stem}.send.mp4")
+        if not new.exists() or new.stat().st_size == 0:
+            return out
+        new_mb = new.stat().st_size / 1024 / 1024
+        if new_mb >= src_mb * 0.95:
+            # 压不下去（源码率本来就低），别浪费那点差别
+            new.unlink(missing_ok=True)
+            logger.info(f"[mailvideo] 压缩收益可忽略（{new_mb:.1f}MB），发送原文件")
+            return out
+        logger.info(
+            f"[mailvideo] 瘦身完成: {src_mb:.1f}MB → {new_mb:.1f}MB"
+            f"（-{(1 - new_mb / src_mb) * 100:.0f}%，耗时 {time.time() - t0:.1f}s）"
+        )
+        return {
+            "skipped": False,
+            "path": str(new),
+            "original_path": str(path),
+            "original_mb": src_mb,
+            "size_mb": new_mb,
+            "seconds": round(time.time() - t0, 1),
+        }
+
     def _ffmpeg_bin(self) -> str:
         if self.ffmpeg_path and Path(self.ffmpeg_path).exists():
             return str(self.ffmpeg_path)
@@ -1183,35 +1336,24 @@ class VideoFetcher:
         估算失败（非 HLS、网络异常等）时返回 ``True``，交给后续流程处理。
         """
         try:
-            import httpx
-
+            hdrs = self._media_headers(referer)
+            bw = 0
             with contextlib.nullcontext(
                 self._shared_client(media_url, timeout=self.timeout, kind="probe")
             ) as client:
-                resp = client.get(media_url, headers=self._media_headers(referer))
+                resp = client.get(media_url, headers=hdrs)
                 resp.raise_for_status()
                 text = resp.text
+                final_url = media_url
+                if "#EXT-X-STREAM-INF" in text:
+                    # 主播放列表：按码率上限选档，之后一律用选中那一路估算，
+                    # 保证「预检的体积」和「实际下载的体积」是同一个档。
+                    final_url, text, bw = self._pick_variant(text, final_url, client, hdrs)
 
             # 不是 HLS 清单（也不是 m3u8）→ 无法估算，放行交给 yt-dlp
             if "#EXTM3U" not in text and "#EXTINF" not in text:
                 return True
-
-            if "#EXT-X-STREAM-INF" in text:
-                # 主播放列表：交给 chooser 选最高码率再估
-                best_uri, best_bw = None, -1
-                lines = [l.strip() for l in text.splitlines()]
-                for i, line in enumerate(lines):
-                    if line.startswith("#EXT-X-STREAM-INF"):
-                        m = re.search(r"BANDWIDTH=(\d+)", line)
-                        bw = int(m.group(1)) if m else 0
-                        for nxt in lines[i + 1:]:
-                            if nxt and not nxt.startswith("#"):
-                                if bw > best_bw:
-                                    best_bw, best_uri = bw, nxt
-                                break
-                if best_uri:
-                    sub = urljoin(media_url, best_uri)
-                    return self._within_size_limit(sub, max_size_mb, referer)
+            if "#EXT-X-STREAM-INF" in text:  # 选档后仍是 master，说明结构异常
                 return True
 
             dur = 0.0
@@ -1219,21 +1361,45 @@ class VideoFetcher:
                 dur += float(m.group(1))
             if dur <= 0:
                 return True
-            seg = 0
-            for line in text.splitlines():
-                if line and not line.startswith("#"):
-                    seg += 1
+            seg_urls = [ln.strip() for ln in text.splitlines()
+                        if ln.strip() and not ln.startswith("#")]
+            seg = len(seg_urls)
             if seg <= 0:
                 return True
-            # 按 1.5 Mbps 保守估算体积
-            est_mb = dur * 1.5 / 8
+
+            # 体积估算优先级：master 的 BANDWIDTH（最准、零成本）→ 首片实测
+            # 长度 × 分片数 → 1.5Mbps 兜底。预检就是为了不白下几百 MB，
+            # 值得多发一个 HEAD。
+            if bw > 0:
+                est_bytes = dur * bw / 8
+                how = f"{bw / 1_000_000:.2f}Mbps"
+            else:
+                est_bytes = 0.0
+                try:
+                    first = urljoin(final_url, seg_urls[0])
+                    hr = client.head(first, headers=hdrs, timeout=min(self.probe_timeout + 3, 8))
+                    clen = int(hr.headers.get("Content-Length") or 0)
+                    if clen > 0:
+                        est_bytes = clen * seg
+                except Exception:
+                    est_bytes = 0.0
+                if est_bytes > 0:
+                    how = f"首片 {est_bytes / seg / 1024:.0f}KB × {seg}"
+                else:
+                    est_bytes = dur * 1.5 * 1_000_000 / 8
+                    how = "1.5Mbps 兜底"
+
+            est_mb = est_bytes / 1024 / 1024
+            # 缓存播放列表文本，下载阶段直接复用，省一次往返
+            if len(self._playlist_cache) > 32:  # 失败任务会残留，别无限涨
+                self._playlist_cache.clear()
+            self._playlist_cache[media_url] = (final_url, text)
             # 缓存下来，下载阶段用来算进度百分比
             self._duration_cache[media_url] = dur
-            self._size_cache[media_url] = est_mb * 1024 * 1024
             ok = est_mb <= max_size_mb
             logger.info(
-                f"[mailvideo] 预检: 时长 {dur:.0f}s | 分片 {seg} | 估算 {est_mb:.0f}MB "
-                f"| 限制 {max_size_mb}MB -> {'通过' if ok else '超限跳过'}"
+                f"[mailvideo] 预检: 时长 {dur:.0f}s | 分片 {seg} | 估算 {est_mb:.0f}MB"
+                f"（{how}）| 限制 {max_size_mb}MB -> {'通过' if ok else '超限跳过'}"
             )
             return ok
         except Exception as e:
@@ -1346,248 +1512,6 @@ class VideoFetcher:
             return str(max(files, key=lambda p: p.stat().st_mtime))
         return None
 
-    def _download_direct(self, url: str, dest_dir: Path, headers: Optional[dict] = None) -> dict:
-        """直链下载（单文件 mp4/flv/mkv 等）。
-
-        服务端支持 ``Range`` 且文件够大时改用**多连接分段并发**，各段按偏移
-        直接写入同一文件，不再额外拼接一遍。探测或分段失败都会自动退回原来
-        的单连接流式下载，不会让任务失败。
-        """
-        import httpx
-
-        name = Path(urlparse(url).path).name or "video.mp4"
-        name = re.sub(r"[^\w.\-]+", "_", name)
-        if len(name) > 100:  # 防止超长哈希名触发 ENAMETOOLONG
-            suffix = Path(name).suffix[:10]
-            name = name[:100] + suffix
-        if not name.lower().endswith(_MEDIA_EXT):
-            name += ".mp4"
-        out = Path(dest_dir) / name
-        hdrs = dict(headers or self._http_headers())
-        start = time.time()
-
-        # ── 1) 探测体积与 Range 支持（多连接分段的前提）──
-        if self.direct_parallel_workers > 1:
-            total = 0
-            try:
-                total, ranges_ok = self._probe_range_support(url, hdrs)
-            except Exception as e:
-                logger.debug(f"[mailvideo] Range 探测失败（忽略）: {e}")
-                total, ranges_ok = 0, False
-
-            if ranges_ok and total >= self.direct_parallel_min_mb * 1024 * 1024:
-                try:
-                    logger.info(
-                        f"[mailvideo] 直链走多连接分段下载（"
-                        f"{self.direct_parallel_workers} 连接 / {self._human_size(total)}）"
-                    )
-                    self._download_ranges(url, out, hdrs, total)
-                    logger.info(
-                        f"[mailvideo] ✅ 分段下载完成 {name} | "
-                        f"{self._human_size(out.stat().st_size)} | "
-                        f"耗时 {time.time() - start:.1f}s"
-                    )
-                    return {
-                        "path": str(out),
-                        "title": out.stem,
-                        "webpage_url": url,
-                        "filesize": out.stat().st_size,
-                    }
-                except Exception as e:
-                    logger.warning(f"[mailvideo] 分段下载失败，回退单连接: {e}")
-                    try:
-                        out.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
-        # ── 2) 单连接流式下载（原有逻辑，作为兜底）──
-        # 同样走共享连接池：分段尝试用剩的连接还能接着用，不必再握手
-        client = self._shared_client(
-            url, timeout=httpx.Timeout(None, connect=20.0), kind="direct"
-        )
-        with contextlib.nullcontext(client) as client:
-            with client.stream("GET", url, headers=hdrs) as resp:
-                resp.raise_for_status()
-                try:
-                    total = int(resp.headers.get("Content-Length") or 0)
-                except (TypeError, ValueError):
-                    total = 0
-                logger.info(
-                    f"[mailvideo] 直链开始下载: {name}"
-                    + (f"（{self._human_size(total)}）" if total else "")
-                )
-                done = 0
-                last_log = 0.0
-                with open(out, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
-                        f.write(chunk)
-                        done += len(chunk)
-                        now = time.time()
-                        if now - last_log >= self.progress_interval:
-                            last_log = now
-                            elapsed = max(now - start, 0.001)
-                            pct = f"{done / total * 100:.1f}%" if total else "—"
-                            logger.info(
-                                f"[mailvideo] ⏳ 下载中 {self._human_size(done)}"
-                                + (f"/{self._human_size(total)}" if total else "")
-                                + f" | 进度 {pct} | 速度 {self._human_size(done / elapsed)}/s"
-                                + f" | 耗时 {elapsed:.1f}s"
-                            )
-        if not out.exists() or out.stat().st_size == 0:
-            raise VideoFetchError("直链下载得到空文件")
-        logger.info(
-            f"[mailvideo] ✅ 下载完成 {name} | {self._human_size(out.stat().st_size)} "
-            f"| 耗时 {time.time() - start:.1f}s"
-        )
-        return {"path": str(out), "title": out.stem, "webpage_url": url, "filesize": out.stat().st_size}
-
-    def _probe_range_support(self, url: str, headers: dict) -> tuple[int, bool]:
-        """用 ``Range: bytes=0-0`` 探测服务端是否支持分段，返回 (总字节数, 是否支持)。"""
-        import httpx
-
-        hdrs = dict(headers)
-        hdrs["Range"] = "bytes=0-0"
-        # 用共享连接池取 Client（池超时按长时间下载设），探测这一次请求再用
-        # 请求级超时卡住；这样随后的 12 个分段能直接复用这条已握好手的连接
-        client = self._shared_client(
-            url, timeout=httpx.Timeout(None, connect=20.0), kind="range"
-        )
-        with contextlib.nullcontext(client) as client:
-            with client.stream("GET", url, headers=hdrs, timeout=self.timeout) as resp:
-                resp.raise_for_status()
-                if resp.status_code == 206:
-                    m = re.search(
-                        r"/(\d+)\s*$", resp.headers.get("Content-Range") or ""
-                    )
-                    if m:
-                        return int(m.group(1)), True
-                    return 0, False
-                # 返回 200 说明服务端忽略了 Range → 不支持分段
-                try:
-                    return int(resp.headers.get("Content-Length") or 0), False
-                except (TypeError, ValueError):
-                    return 0, False
-
-    def _download_ranges(self, url: str, out: Path, headers: dict, total: int) -> None:
-        """多连接分段下载并写入同一文件。任一段最终失败则整体抛错。"""
-        import concurrent.futures
-        import httpx
-
-        workers = max(1, min(self.direct_parallel_workers, 32))
-        # 分段太小反而更慢：每段至少 1MB，不够就减少连接数
-        while workers > 1 and -(-total // workers) < 1024 * 1024:
-            workers -= 1
-
-        part = -(-total // workers)  # 向上取整
-        ranges: list[tuple[int, int]] = []
-        pos = 0
-        while pos < total:
-            end = min(pos + part - 1, total - 1)
-            ranges.append((pos, end))
-            pos = end + 1
-
-        # 预分配，保证各段能按偏移直接写入
-        with open(out, "wb") as f:
-            f.truncate(total)
-
-        lock = threading.Lock()
-        done = [0]
-        progress = {"bytes": 0}
-        errors: list[str] = []
-        start = time.time()
-
-        # 所有分段共用同一个连接池：只在这一处取 Client，worker 直接复用它，
-        # 不再「每段新建一个 Client」（12 段 = 12 次 TCP+TLS 握手）
-        client = self._shared_client(
-            url, timeout=httpx.Timeout(None, connect=20.0), kind="range"
-        )
-
-        def _worker(idx: int, rng: tuple[int, int]) -> bool:
-            s, e = rng
-            expect = e - s + 1
-            last_err = ""
-            for attempt in range(3):
-                try:
-                    got = self._fetch_range(
-                        url, out, headers, s, e, progress, lock, client=client
-                    )
-                    if got != expect:
-                        raise IOError(f"分段长度不符（收到 {got}，应为 {expect}）")
-                    with lock:
-                        done[0] += 1
-                    return True
-                except Exception as ex:
-                    last_err = str(ex)
-                    if attempt < 2:
-                        time.sleep(0.5 * (attempt + 1))
-            errors.append(f"段{idx}({s}-{e}): {last_err}")
-            return False
-
-        logger.info(f"[mailvideo] 分段下载 {len(ranges)} 段（{workers} 连接）…")
-        last_log = start
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(_worker, i, rng) for i, rng in enumerate(ranges)]
-            for _ in concurrent.futures.as_completed(futures):
-                now = time.time()
-                if now - last_log >= self.progress_interval:
-                    last_log = now
-                    elapsed = max(now - start, 0.001)
-                    got = progress["bytes"]
-                    logger.info(
-                        f"[mailvideo] ⏳ 分段下载 {done[0]}/{len(ranges)} 段 | "
-                        f"{self._human_size(got)}/{self._human_size(total)} | "
-                        f"{self._human_size(got / elapsed)}/s | {elapsed:.1f}s"
-                    )
-
-        if errors:
-            raise VideoFetchError(f"{len(errors)}/{len(ranges)} 段下载失败: {errors[:3]}")
-        if progress["bytes"] != total:
-            raise VideoFetchError(
-                f"分段下载字节数不符（{progress['bytes']} != {total}）"
-            )
-
-    def _fetch_range(
-        self,
-        url: str,
-        out: Path,
-        headers: dict,
-        start_byte: int,
-        end_byte: int,
-        progress: dict,
-        lock: "threading.Lock",
-        client=None,
-    ) -> int:
-        """下载 ``[start_byte, end_byte]`` 并写入 ``out`` 的对应偏移，返回写入字节数。
-
-        ``client`` 由 :meth:`_download_ranges` 传入，12 个分段共用它；省略时
-        才回落到共享连接池自行取一个（保持单独调用时的兼容性）。
-        """
-        import httpx
-
-        hdrs = dict(headers)
-        hdrs["Range"] = f"bytes={start_byte}-{end_byte}"
-        written = 0
-        with contextlib.nullcontext(
-            client
-            or self._shared_client(
-                url, timeout=httpx.Timeout(None, connect=20.0), kind="range"
-            )
-        ) as client:
-            with client.stream("GET", url, headers=hdrs) as resp:
-                if resp.status_code != 206:
-                    raise IOError(f"服务端未按 Range 返回（HTTP {resp.status_code}）")
-                with open(out, "r+b") as f:
-                    f.seek(start_byte)
-                    for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
-                        f.write(chunk)
-                        written += len(chunk)
-                        with lock:
-                            progress["bytes"] += len(chunk)
-        return written
-
-    # ============================================================== #
-    # 基础配置
-    # ============================================================== #
     # ============================================================== #
     # 媒体域名分流 + 共享连接池
     # ============================================================== #
@@ -1685,16 +1609,8 @@ class VideoFetcher:
 
     def _pool_workers(self, kind: str) -> int:
         """该用途的并发线程数（连接池上限按它 × 2 开）。"""
-        if kind == "range":
-            # 直链 Range 分段的并发就是 direct_parallel_workers
-            n = self.direct_parallel_workers
-        elif kind == "direct":
-            # 单连接流式兜底：一次只有一个在跑，留两个连接给探测/重试
-            n = 2
-        else:
-            # HLS：m3u8 / 密钥 / 分片共用，跑满 hls_parallel_workers 个线程
-            n = self.hls_parallel_workers
-        return max(1, int(n or 1))
+        # m3u8 / 密钥 / 分片 / 预检共用，跑满 hls_parallel_workers 个线程
+        return max(1, int(self.hls_parallel_workers or 1))
 
     def _shared_client(self, url: str, timeout=None, kind: str = "seg"):
         """取共享 Client（按「直连/代理 × 用途」分桶），复用连接池。
@@ -1773,30 +1689,3 @@ class VideoFetcher:
         if ff:
             opts["ffmpeg_location"] = ff
         return opts
-
-    def probe_direct_url(self, url: str) -> bool:
-        """探测地址是否是可直下的媒体文件（用于无 ffmpeg 时的降级判断）。"""
-        if url.lower().endswith(_MEDIA_EXT):
-            return True
-        try:
-            import httpx
-
-            with httpx.Client(
-                headers=self._http_headers(),
-                timeout=self.timeout,
-                follow_redirects=True,
-                proxy=self._proxy_for(url),
-            ) as client:
-                resp = client.head(url)
-                ctype = resp.headers.get("content-type", "").lower()
-                return ctype.startswith("video/") or "mpegurl" in ctype
-        except Exception:
-            return False
-
-
-def list_output_files(dest_dir: Path) -> list[str]:
-    """列出目录下的文件（供调试）。"""
-    try:
-        return [str(p) for p in Path(dest_dir).glob("*") if p.is_file()]
-    except Exception:
-        return []

@@ -1,8 +1,7 @@
 """mailvideo 下载加速改动的集成验证：本地起 HTTP 服务实跑。
 
 覆盖：
-  A. 直链 + 服务端支持 Range  → 走多连接分段，文件必须与源文件字节一致
-  B. 直链 + 服务端不支持 Range → 自动退回单连接，文件仍必须一致
+  A. 直链 mp4 → 交给 yt-dlp 兜底，文件必须与源文件字节一致
   C. HLS 并行下载（纯合并）   → 产物可解码、时长正常
 """
 
@@ -224,48 +223,25 @@ def main():
     src, big = build_media()
     print(f"素材: source={src.stat().st_size/1024/1024:.2f}MB  big={big.stat().st_size/1024/1024:.2f}MB")
 
-    rng_srv, rng_base = serve(RangeHandler)
     nor_srv, nor_base = serve(NoRangeHandler)
-    print(f"Range 服务 {rng_base} / NoRange 服务 {nor_base}\n")
+    print(f"直链服务 {nor_base}\n")
 
-    # ---------------- A. 直链 + Range ----------------
-    print("A. 直链多连接分段下载")
+    # ---------------- A. 直链 mp4 走 yt-dlp ----------------
+    print("A. 直链 mp4（yt-dlp 兜底）")
     out_a = WORK / "out_a"
     out_a.mkdir(exist_ok=True)
-    f = VideoFetcher(direct_parallel_workers=4, direct_parallel_min_mb=1, timeout=10)
-    calls = []
-    orig_fetch = f._fetch_range
-
-    def spy(*a, **k):
-        calls.append(a[3])
-        return orig_fetch(*a, **k)
-
-    f._fetch_range = spy
-    res = f._download_direct(f"{rng_base}/big.mp4", out_a)
+    f = VideoFetcher(timeout=10)
+    res = f.download(f"{nor_base}/big.mp4", out_a, title="direct")
     got = Path(res["path"])
-    check("A1 走的是多连接分段", len(calls) >= 2, f"发起了 {len(calls)} 段")
-    check("A2 分段后与源文件字节一致", md5(got) == md5(big))
-    check("A3 体积与源一致", got.stat().st_size == big.stat().st_size,
-          f"{got.stat().st_size} vs {big.stat().st_size}")
-
-    # ---------------- B. 直链 + 不支持 Range ----------------
-    print("\nB. 直链不支持 Range → 退回单连接")
-    out_b = WORK / "out_b"
-    out_b.mkdir(exist_ok=True)
-    f2 = VideoFetcher(direct_parallel_workers=4, direct_parallel_min_mb=1, timeout=10)
-    calls2 = []
-    f2._fetch_range = lambda *a, **k: calls2.append(1)
-    res2 = f2._download_direct(f"{nor_base}/big.mp4", out_b)
-    got2 = Path(res2["path"])
-    check("B1 未走分段（自动降级）", len(calls2) == 0)
-    check("B2 单连接下载文件正确", md5(got2) == md5(big))
+    check("A1 产物存在", got.exists() and got.stat().st_size > 0, f"{got.stat().st_size}B")
+    check("A2 与源文件字节一致", md5(got) == md5(big))
 
     # ---------------- C. HLS 纯合并 ----------------
     print("\nC. HLS 并行下载（纯合并）")
     out_c = WORK / "out_c"
     out_c.mkdir(exist_ok=True)
     f3 = VideoFetcher(hls_parallel_workers=4, timeout=10)
-    res3 = f3._download_hls_parallel(f"{rng_base}/index.m3u8", out_c, title="c")
+    res3 = f3._download_hls_parallel(f"{nor_base}/index.m3u8", out_c, title="c")
     p3 = Path(res3["path"])
     check("C1 产物存在且非空", p3.exists() and p3.stat().st_size > 0,
           f"{p3.stat().st_size/1024/1024:.2f}MB")
@@ -279,7 +255,6 @@ def main():
     check("D3 只留一个成品文件", len(list(out_c.glob("*.mp4"))) == 1,
           f"目录内 mp4 数 = {len(list(out_c.glob('*.mp4')))}")
 
-    rng_srv.shutdown()
     nor_srv.shutdown()
 
     print("\n" + "=" * 52)

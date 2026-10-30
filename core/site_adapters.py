@@ -89,6 +89,10 @@ _SKIP_HOST_HINTS = (
 )
 
 
+#: 站点地址解析结果的缓存时长（秒）
+_RESOLVE_TTL = 1800
+
+
 class TiangouAdapter:
     """添狗资源（tiangou）系站点适配器。
 
@@ -106,18 +110,16 @@ class TiangouAdapter:
     """
 
     name = "tiangou"
-    #: 站点地址解析结果的缓存时长（秒）
-    RESOLVE_TTL = 1800
 
     def __init__(
         self,
         fetcher: Any,
-        ttl: int = RESOLVE_TTL,
+        ttl: int = _RESOLVE_TTL,
         melon_pages: int = 3,
         search_pages: int = 2,
     ) -> None:
         self.fetcher = fetcher
-        self.ttl = max(60, int(ttl or RESOLVE_TTL))
+        self.ttl = max(60, int(ttl or _RESOLVE_TTL))
         # 吃瓜栏目没有关键词接口，只能拉列表再本地过滤标题；
         # 这里限制最多翻几页（每页 14 条），0 = 不搜吃瓜。
         self.melon_pages = max(0, int(melon_pages or 0))
@@ -399,10 +401,6 @@ class TiangouAdapter:
     def _fetch_playlist(self, url: str) -> str:
         """取 m3u8 文本（一次请求，供可用性判断与域名探测复用）。"""
         return self._get_text(url)
-
-    def _playable(self, url: str) -> bool:
-        """轻量校验 m3u8 是否可拉（防止 serial 拼错时把死链丢给下载器）。"""
-        return "#EXTM3U" in self._fetch_playlist(url)[:400]
 
     #: m3u8 里的分片域名失效时按顺序尝试的镜像域名
     _TS_HOST_FALLBACKS = ("ts2.zblsjy.com",)
