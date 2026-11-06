@@ -1,240 +1,56 @@
 {
-  "email_account": {
-    "description": "登录/发件邮箱地址",
+  "site_url": {
+    "description": "站点地址",
     "type": "string",
     "default": "",
-    "hint": "例如 123456@qq.com。QQ 邮箱需先在网页版设置中开启 IMAP/SMTP 服务。"
+    "hint": "直接填站点链接就行，比如 https://example.com。搜索入口会自动去试，不用再写 JSON。"
   },
-  "email_auth_code": {
-    "description": "邮箱授权码",
+  "proxy": {
+    "description": "下载/搜片走的代理",
     "type": "string",
-    "default": "",
-    "secret": true,
-    "obvious_hint": true,
-    "hint": "QQ 邮箱为「IMAP/SMTP 授权码」，不是 QQ 登录密码。"
+    "default": "http://127.0.0.1:7890",
+    "hint": "留空则直连；支持 http:// 与 socks5://"
   },
-  "imap_server": {
-    "description": "IMAP 服务器",
-    "type": "string",
-    "default": "imap.qq.com"
-  },
-  "imap_port": {
-    "description": "IMAP 端口（SSL）",
+  "max_results": {
+    "description": "每次返回几条候选",
     "type": "int",
-    "default": 993
+    "default": 10
   },
-  "smtp_server": {
-    "description": "SMTP 服务器",
-    "type": "string",
-    "default": "smtp.qq.com"
-  },
-  "smtp_port": {
-    "description": "SMTP 端口（SSL）",
+  "max_filesize_mb": {
+    "description": "单个文件大小上限(MB)",
     "type": "int",
-    "default": 465
+    "default": 120,
+    "hint": "0 表示不限制"
   },
-  "recipient_email": {
-    "description": "收件邮箱（用户设置的邮箱）",
-    "type": "string",
-    "default": "",
-    "hint": "插件会向该邮箱发送邮件，并等待其回信，从回信正文中提取站点地址。"
-  },
-  "mail_subject": {
-    "description": "发信主题",
-    "type": "string",
-    "default": "获取地址",
-    "hint": "如对方是「关键词自动回复」服务，请填写其要求的触发词。"
-  },
-  "mail_body": {
-    "description": "发信正文（任意消息）",
-    "type": "text",
-    "default": "获取最新地址"
-  },
-  "reply_wait_timeout": {
-    "description": "等待回信超时（秒）",
+  "max_send_mb": {
+    "description": "超过多少 MB 改用文件发送",
     "type": "int",
-    "default": 120
+    "default": 80
   },
-  "reply_poll_interval": {
-    "description": "轮询回信间隔（秒）",
-    "type": "int",
-    "default": 5
-  },
-  "address_regex": {
-    "description": "自定义地址提取正则（可选）",
-    "type": "string",
-    "default": "",
-    "hint": "留空使用内置规则。填写后优先按此正则的捕获组提取。"
-  },
-  "site_1_enabled": {
-    "description": "【固定站点1】启用",
+  "send_as_file": {
+    "description": "一律以文件形式发送（不走视频消息）",
     "type": "bool",
     "default": false
   },
-  "site_1_address": {
-    "description": "【固定站点1】地址",
+  "cookiefile": {
+    "description": "年龄验证cookies",
     "type": "string",
     "default": "",
-    "hint": "例如 https://example.cc/。启用后直连该地址，跳过邮件取址。tiangou 系可直接填永久发布页（如 www.tiangou2.cc），开启站点适配器后会自 动解析出当前真实站点。"
+    "hint": "填导出好的 cookies.txt 绝对路径，Netscape 格式；需要登录/过年龄验证的站点用"
   },
-  "site_2_enabled": {
-    "description": "【固定站点2】启用",
-    "type": "bool",
-    "default": false
-  },
-  "site_2_address": {
-    "description": "【固定站点2】地址",
-    "type": "string",
-    "default": "",
-    "hint": "上一个站点未启用时才会用到；填了地址但开关关闭则忽略。"
-  },
-  "site_3_enabled": {
-    "description": "【固定站点3】启用",
-    "type": "bool",
-    "default": false
-  },
-  "site_3_address": {
-    "description": "【固定站点3】地址",
-    "type": "string",
-    "default": "",
-    "hint": "三个固定站点按 1→2→3 顺序取第一个「已启用且非空」的地址。"
-  },
-  "use_cache_on_fail": {
-    "description": "提取失败时回退上次成功地址",
-    "type": "bool",
-    "default": true
-  },
-  "search_url_template": {
-    "description": "站点搜索 URL 模板",
-    "type": "string",
-    "default": "{base}/search?wd={keyword}",
-    "hint": "支持 {base}（站点地址）与 {keyword}（关键词，URL 已编码）/ {raw_keyword}（不编码）占位符。可用 || 或换行分隔多个模板，按顺序尝试，哪个先搜到结果就用哪个；例如同时兼容两种写法：{base}/search?query={keyword} || {base}/search/{keyword}/"
-  },
-  "select_candidates": {
-    "description": "【回传】候选清单最多列出几条",
+  "timeout": {
+    "description": "搜索请求超时(秒)",
     "type": "int",
-    "default": 10,
-    "hint": "搜索完成后列出的候选上限；用户回复序号后只下载选中的那一个。"
+    "default": 20
   },
-  "select_timeout": {
-    "description": "【回传】候选选择的等待时间（秒）",
+  "download_timeout": {
+    "description": "下载超时(秒)",
     "type": "int",
-    "default": 180,
-    "hint": "超过该时长仍未回复序号，候选清单自动失效。"
+    "default": 600
   },
-  "cookie": {
-    "description": "目标站点 Cookie（可选）",
-    "type": "text",
-    "default": "",
-    "secret": true
-  },
-  "http_proxy": {
-    "description": "HTTP/SOCKS 代理（可选）",
-    "type": "string",
-    "default": "",
-    "hint": "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
-  },
-  "auto_probe_direct": {
-    "description": "【分流】媒体域名自动直连探测",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后：站点页面仍走代理，但视频 CDN（m3u8/分片/直链）会先直连试探 1KB，通了就直连、不通才走代理，并按域名记住结果。代理往往比 CDN 直连慢一个数量级，开启可显著提速。"
-  },
-  "proxy_bypass_hosts": {
-    "description": "【分流】强制直连的域名",
-    "type": "string",
-    "default": "",
-    "hint": "开启后：站点页面仍走代理，但视频 CDN（m3u8/分片）会先直连试探 1KB，通了就直连、不通才走代理，并按域名记住结果。代理往往比 CDN 直连慢一个数量级，开启可显著提速。"
-  },
-  "proxy_force_hosts": {
-    "description": "【分流】强制走代理的域名",
-    "type": "string",
-    "default": "",
-    "hint": "逗号/空格分隔。命中的域名一律走代理，优先级高于自动探测与「强制直连」。用于视频 CDN 也被墙的站点。"
-  },
-  "probe_timeout": {
-    "description": "【分流】直连探测超时（秒）",
+  "pending_ttl": {
+    "description": "搜索结果有效期(秒)",
     "type": "int",
-    "default": 5,
-    "hint": "判定一个媒体域名是否需要代理时，直连试探等待的最长时间。超过该时长未响应即判为被墙、走代理。"
-  },
-  "ffmpeg_path": {
-    "description": "ffmpeg 可执行文件路径（可选）",
-    "type": "string",
-    "default": "",
-    "hint": "留空则使用系统 PATH 中的 ffmpeg。m3u8 合并、音视频合流需要它。"
-  },
-  "send_as": {
-    "description": "回传形式",
-    "type": "string",
-    "default": "video",
-    "options": [
-      "video",
-      "file"
-    ]
-  },
-  "send_heartbeat_interval": {
-    "description": "发送心跳日志间隔（秒）：等待平台上传返回期间，每隔多久写一条「发送中」日志，0/1 最小为 1",
-    "type": "int",
-    "default": 5
-  },
-  "max_video_size_mb": {
-    "description": "单个视频大小上限（MB）",
-    "type": "int",
-    "default": 1024,
-    "hint": "超过该值不再直接发文件，改为返回直链文本，避免平台发送失败。默认 1024MB（1GB）。"
-  },
-  "allowed_users": {
-    "description": "允许使用的用户 ID 列表（留空 = 所有人）",
-    "type": "list",
-    "default": []
-  },
-  "hls_parallel_workers": {
-    "description": "【下载】HLS 并行下载线程数（0=禁用并行）",
-    "type": "int",
-    "default": 24,
-    "hint": "并行下载 m3u8 分片的线程数。全部请求共用一个连接池（池上限 = 线程数 × 2，keep-alive 30 秒），连接可复用后单连接开销大幅下降，所以默认从 16 提到 24：握手压力几乎不增，吞吐更高。若你的源站会限速/排队，再往下调（12-16）即可。填 0 禁用并行，回退到 ffmpeg 串行拉流。填 4-8 适合带宽较小的服务器。"
-  },
-  "http2": {
-    "description": "【下载】分片下载启用 HTTP/2 多路复用",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后 HLS 分片走 HTTP/2，单个连接可并发多个请求，减少握手和队头阻塞，对「多小分片」提速明显；需要 h2 依赖，且仅对 HTTPS 媒体生效。个别老 CDN/代理不兼容 h2 时，程序会自动回退 HTTP/1.1；也可手动关闭强制走 1.1。"
-  },
-  "enable_site_adapters": {
-    "description": "【站点适配】启用 SPA 站点适配器（tiangou 系：发布页 → 真实站 → JSON 接口搜索 → 拼接 m3u8）",
-    "type": "bool",
-    "default": true,
-    "hint": "这类站的页面是 JS 壳（document.write(decodeURIComponent(...))），视频列表全在 /search.json 等接口里，播放地址由 serial_number 前端拼成 m3u8，通用 HTML 规则一条都抓不到，必须靠适配器。开启后：填发布页（如 www.tiangou2.cc）会自动反查真实站点；关闭则退回纯通用解析。"
-  },
-  "melon_search_pages": {
-    "description": "【站点适配】吃瓜栏目搜索翻页数（每页 14 条，0 = 不搜吃瓜）",
-    "type": "int",
-    "default": 3,
-    "hint": "吃瓜（melon）栏目没有关键词搜索接口，只能拉列表、解密标题后本地过滤。翻得越多命中率越高，但每次搜索会多几个请求（每页约 50KB）。默认 3 页≈42 条，够常用关键词命中；想翻全站可调到 10 以上（全站约 37 页）。"
-  },
-  "segment_host_fallbacks": {
-    "description": "【站点适配】分片 CDN 镜像域名（逗号分隔，m3u8 里的分片域名失效时按顺序探测替换）",
-    "type": "string",
-    "default": "ts2.zblsjy.com",
-    "hint": "站点换 CDN 后，m3u8 里常残留已失效的分片域名（实测同一份分片在 ts2.ywqishu.com 全线超时、在 ts2.zblsjy.com 正常）。填一个能出货的镜像域名即可，工具会先探测 2KB 分片确认可用，再登记整批替换，路径不变。留空则不启用替换。"
-  },
-  "prefer_max_bitrate_mbps": {
-    "description": "【下载】码率上限（Mbps，0=最高画质）",
-    "type": "float",
-    "default": 0,
-    "hint": "master playlist 有多档清晰度时，选「不超过该值的最高一档」。填 2.5 左右能直接省掉一半以上下载体积和上传时间，手机屏幕上看不出区别；填 0 保持原来的最高画质。"
-  },
-  "send_shrink_over_mb": {
-    "description": "【发送】超过该体积先压缩再发（MB，0=关闭）",
-    "type": "float",
-    "default": 0,
-    "hint": "平台上传是整包上行，慢的根因是字节数。开启后超过该值的视频会先压到该体积附近再发，上行时间按比例缩短。代价是转码时间（2 核 libx264 veryfast 约 2~3 倍速），CPU 弱的机器建议配合 prefer_max_bitrate_mbps 从源头选低码率档，而不是靠这里压。"
-  },
-  "send_shrink_height": {
-    "description": "【发送】压缩时最高分辨率",
-    "type": "int",
-    "default": 720,
-    "hint": "压缩时超过该高度会等比缩小。720 足够手机观看。"
+    "default": 600
   }
 }
